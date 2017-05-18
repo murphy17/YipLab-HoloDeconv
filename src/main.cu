@@ -9,9 +9,13 @@
 // ~20ms runtimes earlier were wrong... ArrayFire has lazy evaluation, and eval() is NON-blocking!
 // record for 100 slices now is ~1.25sec
 
-// naive CUDA: 2.2sec thus far, unacceptable
+// this is really slow compared to arrayfire!?!
+// FFTs faster, but other stuff sucks!
 
-// cufftplanmany for batches...
+// stuff to try:
+// - batching: element-wise stuff and FFTs (cufftplanmany)
+// - out-of-place FFTs and multiply
+// - async
 
 // run half as many kernels, use vectorized instructions...
 // https://devblogs.nvidia.com/parallelforall/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
@@ -20,11 +24,8 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 #include <cufft.h>
-
-#include <thrust/transform.h>
-#include <thrust/functional.h>
-#include <thrust/execution_policy.h>
-#include <thrust/complex.h>
+//#include <cuda_runtime.h>
+//#include <cublas_v2.h>
 
 #define N 1024
 #define DX (5.32 / 1024)
@@ -44,7 +45,7 @@ void imshow(cv::Mat img)
 // Kernel to construct the point-spread function at distance z.
 // note that answer will be off by a real-valued factor
 __global__
-void construct_psf(const float z, cuFloatComplex *g)
+void construct_psf(float z, cuFloatComplex *g)
 {
 	int i = threadIdx.x;
 	int j = blockIdx.x; // blockDim shall equal N
@@ -65,7 +66,7 @@ void construct_psf(const float z, cuFloatComplex *g)
 
 // In-place element-wise complex multiply: z[i] <- z[i]*w[i]
 __global__
-void multiply_inplace(cuFloatComplex *z, cuFloatComplex *w)
+void multiply_inplace(cuFloatComplex *z, const __restrict__ cuFloatComplex *w)
 {
 	int ij = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -75,7 +76,7 @@ void multiply_inplace(cuFloatComplex *z, cuFloatComplex *w)
 
 // complex modulus, FFT shift
 __global__
-void mod_shift(const cuFloatComplex *z, float *r)
+void mod_shift(const __restrict__ cuFloatComplex *z, float *r)
 {
 	int i = threadIdx.x;
 	int j = blockIdx.x; // blockDim shall equal N
@@ -114,6 +115,9 @@ int main(void)
 	cufftHandle plan;
 	cufftPlan2d(&plan, N, N, CUFFT_C2C); // cufftplanmany for batch...
 
+//	cublasHandle_t handle;
+//	cublasCreate(&handle);
+
 	// some behaviour I can't explain here.
 	// results look great the first time
 	// second time... output is corrupted (!?!)
@@ -129,7 +133,8 @@ int main(void)
 
 		cufftExecC2C(plan, (cufftComplex *)h, (cufftComplex *)h, CUFFT_FORWARD);
 
-//		float ms = 0;
+		float ms = 0;
+//		cuFloatComplex a = make_cuFloatComplex(1.f, 1.f);
 
 		for (int k = 0; k < num_zs; k++)
 		{
@@ -139,12 +144,26 @@ int main(void)
 
 			cufftExecC2C(plan, (cufftComplex *)g, (cufftComplex *)g, CUFFT_FORWARD); // 0.28s for 100
 
-			multiply_inplace<<<N, N>>>(g, h); // 1.38s for 100
+			cudaEvent_t start, stop;
+			cudaEventCreate(&start);
+			cudaEventCreate(&stop);
+			cudaEventRecord(start);
+
+			multiply_inplace<<<N, N>>>(g, h); // 1.38s for 100 (!?!?!?!?!?! FFT is n2logn, this is n2!!!)
+
+			cudaDeviceSynchronize();
+			cudaEventRecord(stop);
+			cudaEventSynchronize(stop);
+			float ms_ = 0;
+			cudaEventElapsedTime(&ms_, start, stop);
+			ms += ms_;
 
 			cufftExecC2C(plan, (cufftComplex *)g, (cufftComplex *)g, CUFFT_INVERSE); // 0.28s for 100
 
 			mod_shift<<<N, N>>>(g, R_d + N*N*k); // 0.95s for 100
 		}
+
+		std::cout << ms << "ms" << std::endl;
 
 		// do some reduction on the images
 		// ...
@@ -165,11 +184,11 @@ int main(void)
 	cudaFree(h);
 	cudaFree(R_d);
 
-//	for (int k = 0; k < num_zs; k++)
-//	{
-//		cv::Mat B(N, N, CV_32FC1, R_h + k*N*N);
-//		imshow(B);
-//	}
+	for (int k = 0; k < num_zs; k++)
+	{
+		cv::Mat B(N, N, CV_32FC1, R_h + k*N*N);
+		imshow(B);
+	}
 
 	cudaFree(R_h);
 
