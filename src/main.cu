@@ -6,11 +6,17 @@
  *
  */
 
-// ~20ms runtimes earlier were wrong... ArrayFire has lazy evaluation, and eval() is NON-blocking!
-// record for 100 slices now is ~1.25sec
+// it's obvious RT on the Jetson is not going to be a possibility.
+// try this on the server, first of all, it's like 10x faster than the Jetson... lol
+// then try to install AF there
 
-// this is really slow compared to arrayfire!?!
-// FFTs faster, but other stuff sucks!
+// alternative with ArrayFire: construct 1/4 of the kernel, concatenate
+
+// Jetson natively supports FP16... hmmm
+// play with the thread / block sizes.
+
+// ~20ms runtimes earlier were wrong... ArrayFire has lazy evaluation, and eval() is NON-blocking!
+// record for 100 slices now is ~1.25sec, AF
 
 // stuff to try:
 // - batching: element-wise stuff and FFTs (cufftplanmany)
@@ -24,13 +30,31 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 #include <cufft.h>
+#include <cuComplex.h>
 //#include <cuda_runtime.h>
 //#include <cublas_v2.h>
+
+//#include <arrayfire.h>
+//#include <opencv2/opencv.hpp>
+//#include <opencv2/highgui.hpp>
+//#include <algorithm>
 
 #define N 1024
 #define DX (5.32 / 1024)
 #define DY (6.66 / 1280)
 #define LAMBDA0 0.000488
+
+typedef cuFloatComplex complex;
+
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 // Convenience method for plotting
 void imshow(cv::Mat img)
@@ -43,49 +67,110 @@ void imshow(cv::Mat img)
 }
 
 // Kernel to construct the point-spread function at distance z.
-// note that answer will be off by a real-valued factor
+// exploits 4-fold symmetry (PSF is also radially symmetric, but that's harder...)
+// note that answer is scaled between +/-1
 __global__
-void construct_psf(float z, cuFloatComplex *g)
+void construct_psf_4fold(float z, complex *g)
 {
-	int i = threadIdx.x;
-	int j = blockIdx.x; // blockDim shall equal N
+	__shared__ complex g_r[N/2]; // bank conflicts?
+
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+//	int ii = (N - 1) - i;
+//	int jj = (N - 1) - j;
 
 	float x = (i * (float)N/(float)(N-1) - N/2) * DX;
-	float y = (j * (float)N/(float)(N-1) - N/2) * DX;
+	float y = (j * (float)N/(float)(N-1) - N/2) * DY;
 
-	float r = -2 * norm3df(x, y, z) / LAMBDA0;
+	float r = -2.f * norm3df(x, y, z) / LAMBDA0;
 
 	// exp(ix) = cos(x) + isin(x)
 	float re, im;
 	sincospif(r, &im, &re);
 
+	// numerical conditioning, probably unnecessary
+	// also corrects the sign flip above
+	r /= -2.f * z / LAMBDA0;
+
 	// re(iz) = -im(z), im(iz) = re(z)
-	// fix the -1 thing here...
-	g[i*N+j] = make_cuFloatComplex(im / r, -re / r);
+	complex g_ij = make_complex(-im / r, re / r);
+
+	// how is this in terms of memory accesses? ... probably bad?
+	// https://devblogs.nvidia.com/parallelforall/efficient-matrix-transpose-cuda-cc/ !!!!!!
+//	g[i*N+j] = g_ij;
+//	g[i*N+jj] = g_ij;
+//	g[ii*N+j] = g_ij;
+//	g[ii*N+jj] = g_ij;
+
+	// not sure how much the cache prediction (if any) will like the bottom-to-top thing here
+
+	// write the half-row
+	g[i*N+j] = g_ij;
+	g[((N - 1) - i)*N+j] = g_ij;
+	// flip the half-row
+	g_r[(N/2 - 1) - j] = g_ij; // bank conflicts? can't avoid I think
+	__syncthreads(); // needed?
+	// write the flipped half-row
+	g[i*N+j+N/2] = g_r[j];
+	g[((N - 1) - i)*N+j+N/2] = g_r[j];
 }
 
-// In-place element-wise complex multiply: z[i] <- z[i]*w[i]
 __global__
-void multiply_inplace(cuFloatComplex *z, const __restrict__ cuFloatComplex *w)
+void complex_cast(float *x, complex *z)
 {
-	int ij = blockDim.x * blockIdx.x + threadIdx.x;
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
 
-	// re(zw) = re(z)re(w) - im(z)im(w), im(zw) = re(z)im(w) + im(z)re(z)
-	z[ij] = cuCmulf(z[ij], w[ij]);
+	z[i*N+j].x = x[i*N+j];
 }
 
-// complex modulus, FFT shift
-__global__
-void mod_shift(const __restrict__ cuFloatComplex *z, float *r)
+__device__
+void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
 {
-	int i = threadIdx.x;
-	int j = blockIdx.x; // blockDim shall equal N
+	cufftComplex a, b, c;
 
-	int ii = (i + N/2) % N;
-	int jj = (j + N/2) % N;
+	a = element;
+	b = ((cufftComplex*)callerInfo)[offset];
 
-	const cuFloatComplex z_ij = z[i*N+j];
-	r[ii*N+jj] = hypotf(z_ij.x, z_ij.y);
+	c.x = a.x * b.x - a.y * b.y;
+	c.y = a.x * b.y + a.y * b.x;
+
+	((cufftComplex*)dataOut)[offset] = c;
+}
+__managed__
+cufftCallbackStoreC _mul_ptr = _mul;
+
+__global__
+void multiply_inplace(complex *z, complex *w)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	z[i*N+j] = cuCmulf(z[i*N+j], w[i*N+j]);
+}
+
+__global__
+void mod(complex *z, float *r)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
+}
+
+// exploit translation-phase duality to avoid doing any copies
+// credit to http://www.orangeowlsolutions.com/archives/251
+// could vectorize, but runtime is negligible
+__global__
+void invert_phase(complex *data)
+{
+    int i = blockIdx.x;
+    int j = threadIdx.x;
+
+	float a = 1-2*((i+j)&1);
+
+	data[i*N+j].x *= a;
+	data[i*N+j].y *= a;
 }
 
 int main(void)
@@ -102,81 +187,89 @@ int main(void)
     // relevant! http://arrayfire.com/zero-copy-on-tegra-k1/
     // cudaSetDeviceFlags(cudaDeviceMapHost);
 
-    cudaDeviceReset();
+//    cudaDeviceReset();
 
-	cuFloatComplex *g, *h;
-	cudaMalloc((void **)&g, N*N*sizeof(cuFloatComplex));
-	cudaMalloc((void **)&h, N*N*sizeof(cuFloatComplex));
+	complex *g, *h, *f;
+	cudaMalloc((void **)&g, N*N*sizeof(complex));
+	cudaMalloc((void **)&h, N*N*sizeof(complex));
+	cudaMalloc((void **)&f, N*N*sizeof(float));
 
 	float *R_d, *R_h;
 	cudaMallocHost((void **)&R_h, num_zs*N*N*sizeof(float));
 	cudaMalloc((void **)&R_d, num_zs*N*N*sizeof(float));
 
-	cufftHandle plan;
+	cufftHandle plan, plan_cb;
 	cufftPlan2d(&plan, N, N, CUFFT_C2C); // cufftplanmany for batch...
-
-//	cublasHandle_t handle;
-//	cublasCreate(&handle);
+	cufftPlan2d(&plan_mul, N, N, CUFFT_C2C);
+	cufftXtSetCallback(plan_mul, (void **)&_mul_ptr, CUFFT_CB_ST_COMPLEX, (void **)&h);
 
 	// some behaviour I can't explain here.
 	// results look great the first time
 	// second time... output is corrupted (!?!)
-
 	for (int n_frame = 0; n_frame < num_frames; n_frame++)
 	{
-
 		// transfer image to device, adding in imaginary channel
-		A = A + 0.;
-		cudaMemcpy2D(h, sizeof(cuFloatComplex), A.data, sizeof(float), sizeof(float), N*N, cudaMemcpyHostToDevice);
+		cudaMemcpy(f, A.data, N*N*sizeof(float), cudaMemcpyHostToDevice);
+		complex_cast<<<N, N>>>(f, h);
 
+		// I'm really wondering if this is messing with speed; too clever by half
+//		cudaMemcpy2D(h, sizeof(complex), A.data, sizeof(float), sizeof(float), N*N, cudaMemcpyHostToDevice);
+
+//		cudaEvent_t start, stop;
+//		cudaEventCreate(&start);
+//		cudaEventCreate(&stop);
 //		cudaEventRecord(start);
 
 		cufftExecC2C(plan, (cufftComplex *)h, (cufftComplex *)h, CUFFT_FORWARD);
+		// this is subtle - flipping the phase here means we don't need to FFT shift later
+		invert_phase<<<N, N>>>(h);
 
 		float ms = 0;
-//		cuFloatComplex a = make_cuFloatComplex(1.f, 1.f);
 
 		for (int k = 0; k < num_zs; k++)
 		{
 			float z = z_min + dz*k;
 
-			construct_psf<<<N, N>>>(z, g); // 1.09s for 100
+			// performance seems better with more blocks, fewer threads
+			// this actually has 8-fold symmetry. rotate a symmetric matrix 4 times about the origin
+			construct_psf_4fold<<<N/2, N/2>>>(z, g); // 0.40s for 100
 
-			cufftExecC2C(plan, (cufftComplex *)g, (cufftComplex *)g, CUFFT_FORWARD); // 0.28s for 100
+//						cudaEvent_t start, stop;
+//						cudaEventCreate(&start);
+//						cudaEventCreate(&stop);
+//						cudaEventRecord(start);
 
-			cudaEvent_t start, stop;
-			cudaEventCreate(&start);
-			cudaEventCreate(&stop);
-			cudaEventRecord(start);
+			cufftExecC2C(plan_mul, (cufftComplex *)g, (cufftComplex *)g, CUFFT_FORWARD); // 0.28s for 100
 
-			multiply_inplace<<<N, N>>>(g, h); // 1.38s for 100 (!?!?!?!?!?! FFT is n2logn, this is n2!!!)
+//			multiply_inplace<<<N, N>>>(g, h); // 1.38s for 100!?! why so slow???
 
-			cudaDeviceSynchronize();
-			cudaEventRecord(stop);
-			cudaEventSynchronize(stop);
-			float ms_ = 0;
-			cudaEventElapsedTime(&ms_, start, stop);
-			ms += ms_;
+//						cudaDeviceSynchronize();
+//						cudaEventRecord(stop);
+//						cudaEventSynchronize(stop);
+//						float ms_ = 0;
+//						cudaEventElapsedTime(&ms_, start, stop);
+//						ms += ms_;
 
 			cufftExecC2C(plan, (cufftComplex *)g, (cufftComplex *)g, CUFFT_INVERSE); // 0.28s for 100
+			// ordinarily would need to invert phase here, to compensate for earlier (and complete the FFT shift)...
 
-			mod_shift<<<N, N>>>(g, R_d + N*N*k); // 0.95s for 100
+			// ... but since we're just taking the modulus, we don't care about phase
+			mod<<<N, N>>>(g, R_d + N*N*k); // 0.20s for 100
+
 		}
 
-		std::cout << ms << "ms" << std::endl;
+//		cudaDestroyTextureObject(tex);
 
 		// do some reduction on the images
 		// ...
 
 //		cudaEventRecord(stop);
 //		cudaEventSynchronize(stop);
-//		float ms = 0;
 //		cudaEventElapsedTime(&ms, start, stop);
-//		std::cout << ms << "ms" << std::endl;
+
+		std::cout << ms << "ms" << std::endl;
 
 		cudaMemcpy(R_h, R_d, num_zs*N*N*sizeof(float), cudaMemcpyDeviceToHost);
-
-		cudaDeviceSynchronize();
 	}
 
 	// free pointers
@@ -184,28 +277,22 @@ int main(void)
 	cudaFree(h);
 	cudaFree(R_d);
 
-	for (int k = 0; k < num_zs; k++)
-	{
-		cv::Mat B(N, N, CV_32FC1, R_h + k*N*N);
-		imshow(B);
-	}
+//	for (int k = 0; k < num_zs; k++)
+//	{
+//		cv::Mat B(N, N, CV_32FC1, R_h + k*N*N);
+//		imshow(B);
+//	}
 
 	cudaFree(R_h);
 
 	return 0;
 }
 
+
 /*
 
-#include <arrayfire.h>
-#include <opencv2/opencv.hpp>
-#include <opencv2/highgui.hpp>
-#include <algorithm>
-
-#define NO_BATCH
-
 typedef struct {
-	int N;
+//	int N;
 	float lambda0;
 	float del_x;
 	float del_y;
@@ -217,58 +304,55 @@ typedef struct {
 } params_t;
 
 // Populates frequency grid and vector of spacings.
-void setup_vars(params_t params, af::array *grid, af::array *spacings)
-{
-	int n_step = (params.d_max - params.d_min) / params.d_step;
-    // build (symmetric?) path-length grid
-	af::array df = (af::iota(af::dim4(params.N, 1)) * (float)(params.N)/(float)(params.N-1)-params.N/2);
-    *grid = af::tile(af::pow(df * params.del_x, 2), 1, params.N) + af::tile(af::pow(df * params.del_y, 2).T(), params.N, 1);
-    *spacings = af::pow(af::range(af::dim4(n_step)) * params.d_step + params.d_min, 2);
-}
+//void setup_vars(params_t params, af::array *grid, af::array *spacings)
+//{
+//	int n_step = (params.d_max - params.d_min) / params.d_step;
+//    // build (symmetric?) path-length grid
+//	af::array df = (af::iota(af::dim4(N, 1)) * (float)(N)/(float)(N-1)-N/2);
+//    *grid = af::tile(af::pow(df * params.del_x, 2), 1, N) + af::tile(af::pow(df * params.del_y, 2).T(), N, 1);
+//    *spacings = af::pow(af::range(af::dim4(n_step)) * params.d_step + params.d_min, 2);
+//}
 
 // Expands input image into slices, performs a reduction, and writes the result out.
-void process_image(params_t params, af::array &img, float *out_ptr, af::array &x_cube, af::array &grid, af::array &spacings)
+void process_image(params_t params, af::array &img, float *out_ptr, af::array &x_cube) //, af::array &grid, af::array &spacings)
 {
-	af::array x;
+	af::array x(N, N, c32);
 
-	int n_step = spacings.dims(0);
-    af::cfloat k0 = {0., (float)(-2. * af::Pi / params.lambda0)};
-    af::cfloat k1 = {0., (float)(1. / params.lambda0)};
+//	int n_step = spacings.dims(0);
+//    af::cfloat k0 = {0., (float)(-2. * af::Pi / params.lambda0)};
+//    af::cfloat k1 = {0., (float)(1. / params.lambda0)};
+	af::cfloat unit = {0, 1};
 
 	// FFT the input image
 	af::array h_f = af::fft2(img);
+	// phase shift it
+	h_f = h_f * unit;
+
+	int n_step = (params.d_max - params.d_min) / params.d_step;
 
 	// process in batches to fit in memory
 	// ... but this seems to entirely occupy the Tegra...
-#ifdef NO_BATCH
-	for (int i = 0; i < n_step; i++)
-#else
-	for (int j = 0; j < n_step; j += params.n_batch)
-#endif
+	for (int j = 0; j < n_step; j ++)
 	{
-#ifndef NO_BATCH
-		gfor (af::seq i, j, min(n_step, j + params.n_batch) - 1)
-#endif
-		{
-#ifdef NO_BATCH
-			x = af::sqrt(grid + params.d_min + i * params.d_step); // ~0.15sec
-#else
-			x = af::sqrt(grid + spacings(i)); // r  // ~0.15sec
-#endif
-			x = k1 * af::exp(k0 * x) / x; // g
-			af::fft2InPlace(x); // g_f // 0.3sec
+		float z = params.d_min + j * params.d_step;
+		af::sync();
+		complex *d_x = (complex *)x.device<af::cfloat>();
+		construct_psf_4fold<<<N/2, N/2>>>(z, d_x);
+		cudaDeviceSynchronize();
+		x.unlock();
+		// x = af::sqrt(grid + params.d_min + i * params.d_step); // ~0.15sec
+		// x = k1 * af::exp(k0 * x) / x; // g
+		af::fft2InPlace(x); // g_f // 0.3sec
 
-			// note here: g is an even function
-			// so F(g) is real valued and even
-			// (i.e. can I just take FFT of half of g?)
+		// note here: g is an even function
+		// so F(g) is real valued and even
+		// (i.e. can I just take FFT of half of g?)
 
-			x = x * h_f; // gh_f
-			af::ifft2InPlace(x); // h // 0.4sec
-			x = af::abs(x); // |h|
-			x = af::shift(x, x.dims(0)/2, x.dims(1)/2); // FFT shift
+		x = x * h_f; // gh_f
+		af::ifft2InPlace(x); // h // 0.4sec
+		// x = af::shift(x, x.dims(0)/2, x.dims(1)/2); // FFT shift
 
-			x_cube(af::span, af::span, i) = x; // / af::max<float>(x) * 255.; // compression probably unnecessary?
-		}
+		x_cube(af::span, af::span, j) = af::abs(x); // / af::max<float>(x) * 255.; // compression probably unnecessary?
 	}
 
 	// simulate doing some reduction operation that returns a single image per cube
@@ -283,15 +367,15 @@ int main(void)
 {
 	// setup experimental parameters
     params_t params;
-    params.N = 1024; // resolution in pixels
+//    N = 1024; // resolution in pixels
     params.lambda0 = 0.000488; // wavelength
     params.del_x = 5.32 / 1024; // horizontal frequency spacing
     params.del_y = 6.66 / 1280; // vertical frequency spacing
     params.d_max = 130; // max distance from CCD to object, mm
     params.d_min = 30; // min distance from CCD to object, mm
-    params.d_step = 2; // step size in mm
-    params.n_batch = 1; // number of frames per batch; best performance with 1!?!?
-    params.n_frames = 3; // currently, just repeats the analysis
+    params.d_step = 1; // step size in mm
+    int N_batch = 1; // number of frames per batch; best performance with 1!?!?
+    int N_frames = 3; // currently, just repeats the analysis
 
     // load in test image
     cv::Mat mat = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
@@ -300,33 +384,34 @@ int main(void)
     // simulate a DMA buffer on the GPU, i.e. feeding in from video camera
     // will copy in the images as part of the main loop, simulate 'streaming'
     float *img_ptr;
-    cudaMalloc((void **)&img_ptr, params.N * params.N * sizeof(float));
+    cudaMalloc((void **)&img_ptr, N * N * sizeof(float));
 
     // allocate the matrix using our predefined staging area
-    af::array img(params.N, params.N, img_ptr, afDevice);
+    af::array img(N, N, img_ptr, afDevice);
     af::eval(img);
 
     // pin buffer on the host
-    float *h_ptr = af::pinned<float>(params.N * params.N * params.n_frames);
+    float *h_ptr = af::pinned<float>(N * N * N_frames);
 
-    af::array grid;
-    af::array spacings;
-    setup_vars(params, &grid, &spacings);
+//    af::array grid;
+//    af::array spacings;
+//    setup_vars(params, &grid, &spacings);
 
     // allocate this just once and reuse, it's huge
-    int n_step = spacings.dims(0);
-    af::array x_cube(params.N, params.N, n_step, f32);
+//    int n_step = spacings.dims(0);
+    int n_step = (params.d_max - params.d_min) / params.d_step;
+    af::array x_cube(N, N, n_step, f32);
 
-    for (int k = 0; k < params.n_frames; k++)
+    for (int k = 0; k < N_frames; k++)
     {
 		// 'copy the image' - these would be successive frames in reality, and would probably live on GPU
 		// i.e. this copy would not happen
 		mat = mat + 0.; // no possibility of caching
-		cudaMemcpy(img_ptr, mat.data, params.N * params.N * sizeof(float), cudaMemcpyHostToDevice);
+		cudaMemcpy(img_ptr, mat.data, N * N * sizeof(float), cudaMemcpyHostToDevice);
 
 		// expand the image into slices, do a reduction, save result to h_ptr
 		af::timer::start();
-		process_image(params, img, h_ptr + params.N * params.N * k, x_cube, grid, spacings);
+		process_image(params, img, h_ptr + N * N * k, x_cube); //, grid, spacings);
 		std::cout << af::timer::stop() << std::endl;
     }
 
