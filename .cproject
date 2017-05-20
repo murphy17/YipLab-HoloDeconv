@@ -21,7 +21,7 @@
 					<folderInfo id="com.nvidia.cuda.ide.eight_zero.configuration.debug.373183456." name="/" resourcePath="">
 						<toolChain id="com.nvidia.cuda.tools.toolchain.eight_zero.exe.debug.842471862" name="CUDA Toolkit 8.0" superClass="com.nvidia.cuda.tools.toolchain.eight_zero.exe.debug">
 							<targetPlatform archList="all" binaryParser="com.nvidia.cuda.ide.elf;com.nvidia.cuda.ide.macho;com.nvidia.cuda.ide.cubin" id="com.nvidia.cuda.ide.targetPlatform.1387644008" isAbstract="false" name="Debug Platform" osList="linux,macosx" superClass="com.nvidia.cuda.ide.targetPlatform"/>
-							<builder buildPath="${workspace_loc:/HoloDeconv}/Debug" id="com.nvidia.cuda.ide.builder.1285150993" keepEnvironmentInBuildfile="false" managedBuildOn="true" name="CUDA Toolkit 8.0 Builder" superClass="com.nvidia.cuda.ide.builder"/>
+							<builder buildPath="${workspace_loc:/HoloDeconv}/Debug" id="com.nvidia.cuda.ide.builder.1285150993" keepEnvironmentInBuildfile="false" managedBuildOn="true" name="CUDA Toolkit 8.0 Builder" parallelBuildOn="true" parallelizationNumber="16" superClass="com.nvidia.cuda.ide.builder"/>
 							<tool id="nvcc.compiler.base.105011365" name="NVCC Compiler" superClass="nvcc.compiler.base">
 								<option id="nvcc.compiler.deviceDebug.2101482768" name="Generate device debug information (-G)" superClass="nvcc.compiler.deviceDebug" value="true" valueType="boolean"/>
 								<option id="nvcc.compiler.option.level.253706932" name="Generate host debug information (-g)" superClass="nvcc.compiler.option.level" value="true" valueType="boolean"/>
@@ -41,14 +41,19 @@
 							<tool id="nvcc.linker.base.1761753542" name="NVCC Linker" superClass="nvcc.linker.base">
 								<option id="nvcc.linker.option.libs.1374128734" name="Libraries (-l)" superClass="nvcc.linker.option.libs" valueType="libs">
 									<listOptionValue builtIn="false" value="opencv_core"/>
+									<listOptionValue builtIn="false" value="opencv_imgcodecs"/>
+									<listOptionValue builtIn="false" value="opencv_imgproc"/>
+									<listOptionValue builtIn="false" value="culibos"/>
 									<listOptionValue builtIn="false" value="cublas"/>
-									<listOptionValue builtIn="false" value="cufft"/>
+									<listOptionValue builtIn="false" value="cufft_static"/>
 									<listOptionValue builtIn="false" value="nvvm"/>
 									<listOptionValue builtIn="false" value="afcuda"/>
 									<listOptionValue builtIn="false" value="opencv_highgui"/>
 								</option>
 								<option id="nvcc.linker.option.paths.1999860882" name="Library search path (-L)" superClass="nvcc.linker.option.paths" valueType="libPaths">
 									<listOptionValue builtIn="false" value="/usr/local/lib"/>
+									<listOptionValue builtIn="false" value="/usr/local/cuda/nvvm/lib64"/>
+									<listOptionValue builtIn="false" value="/opt/arrayfire/lib"/>
 									<listOptionValue builtIn="false" value="/usr/local/cuda/nvvm/lib"/>
 								</option>
 								<inputType id="nvcc.linker.input.1627029350" superClass="nvcc.linker.input">
@@ -65,9 +70,13 @@
 				</configuration>
 			</storageModule>
 			<storageModule moduleId="com.nvidia.cuda.ide.build.project.ICudaProjectConfiguration">
-				<executable devicelink="false">
-					<sass major="5" minor="3"/>
+				<executable devicelink="true">
 					<ptx major="5" minor="3"/>
+					<ptx major="5" minor="0"/>
+					<ptx major="6" minor="0"/>
+					<sass major="5" minor="3"/>
+					<sass major="5" minor="0"/>
+					<sass major="6" minor="0"/>
 				</executable>
 				<editor-arch major="5" minor="3"/>
 			</storageModule>

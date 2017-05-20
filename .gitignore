@@ -1,0 +1,8 @@
+/.ptp-sync/
+/Debug/
+
+*.prefs
+
+data/.ptp-sync-folder
+
+src/.ptp-sync-folder
