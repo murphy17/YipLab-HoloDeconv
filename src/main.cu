@@ -159,21 +159,13 @@ void byte_to_complex(unsigned char *b, cufftComplex *z)
 }
 
 __global__
-void complex_mod(cufftComplex *z, float *r)
+void complex_modulus(cufftComplex *z, float *r)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
 	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
 }
-
-__device__
-void _mod(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
-{
-	((float *)dataOut)[offset] = hypotf(element.x, element.y);
-}
-__device__
-cufftCallbackStoreC d_mod = _mod;
 
 int main(void)
 {
@@ -188,14 +180,12 @@ int main(void)
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
-	cufftHandle plan, plan_mul, plan_mod;
+	cufftHandle plan, plan_mul;
 	checkCudaErrors( cufftPlan2d(&plan, N, N, CUFFT_C2C) );
 	checkCudaErrors( cufftPlan2d(&plan_mul, N, N, CUFFT_C2C) );
-//	checkCudaErrors( cufftPlan2d(&plan_mod, N, N, CUFFT_C2C) );
 
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
 	checkCudaErrors( cufftSetStream(plan_mul, math_stream) );
-//	checkCudaErrors( cufftSetStream(plan_mod, math_stream) );
 
 	cufftComplex *d_img, *d_psf;
 	checkCudaErrors( cudaMalloc((void **)&d_psf, N*N*sizeof(cufftComplex)) );
@@ -211,10 +201,6 @@ int main(void)
 //	checkCudaErrors( cudaMemcpy(d_params, &h_params, sizeof(callback_t), cudaMemcpyHostToDevice) );
 	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
 //	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_params) );
-
-//	cufftCallbackStoreC h_mod;
-//	checkCudaErrors( cudaMemcpyFromSymbol(&h_mod, d_mod, sizeof(cufftCallbackStoreC)) );
-//	checkCudaErrors( cufftXtSetCallback(plan_mod, (void **)&h_mod, CUFFT_CB_ST_COMPLEX, 0) );
 
 	unsigned char *d_img_u8;
 	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(unsigned char)) );
@@ -244,7 +230,6 @@ int main(void)
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N>>>(d_img);
 
-		// definitely BATCHING is next big speedup
 		for (int slice = 0; slice < num_slices; slice++)
 		{
 			float z = z_min + z_step * slice;
@@ -260,8 +245,8 @@ int main(void)
 
 			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 
-			// revisit this as a callback, 15ms is now not that negligible...
-			complex_mod<<<N, N, 0, math_stream>>>(d_psf, d_slices + N*N*slice); // no need to sync streams, full-size buffer
+			// callback doesn't help here either
+			complex_modulus<<<N, N, 0, math_stream>>>(d_psf, d_slices + N*N*slice); // no need to sync streams, full-size buffer
 
 			// it's actually faster to async each slice, surprisingly
 			// could use just a single image for buffer, stream sync was negligible last I checked
@@ -269,6 +254,9 @@ int main(void)
 		}
 
 		// checkCudaErrors( cudaDeviceSynchronize() );
+
+
+		// now do some reduction to the whole cube...
 
 		std::cout << cudaTimerStop() << "ms" << std::endl;
 		// looking at utilisation, might be able to halve (!!!) that with batching
