@@ -6,39 +6,16 @@
  *
  */
 
-// it's obvious RT on the Jetson is not going to be a possibility.
-// try this on the server, first of all, it's like 10x faster than the Jetson... lol
-// then try to install AF there
-
-// alternative with ArrayFire: construct 1/4 of the kernel, concatenate
-
-// Jetson natively supports FP16... hmmm
-// play with the thread / block sizes.
-
-// ~20ms runtimes earlier were wrong... ArrayFire has lazy evaluation, and eval() is NON-blocking!
-// record for 100 slices now is ~1.25sec, AF
-
-// priority: FFT callbacks; batching; half-precision (latter is apparently good enough for graphics)
-// (suspect batching will make async execution redundant)
-// if memory copying is determined a bottleneck, do the transfers async
-// compare in-place and out-of-place; memory is not the bottleneck here
-
-// run half as many kernels, use vectorized instructions...
-// https://devblogs.nvidia.com/parallelfo rall/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
-// http://stackoverflow.com/questions/26676806/efficiency-of-cuda-vector-types-float2-float3-float4
+// FFT batching
+// async memory transfer
+// half-precision
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-//#include <opencv2/imgcodecs.hpp>
-//#include <cufft.h>
-//#include <cuComplex.h>
-#include <cuda_runtime.h> // need to enable separate program linking, cufft static lib
+#include <cuda_runtime.h>
 #include <cufftXt.h>
-//#include <cublas_v2.h>
-#include "common.h"
 
-//#include <arrayfire.h>
-//#include <algorithm>
+#include "common.h"
 
 #define N 1024
 #define DX (5.32 / 1024)
@@ -103,76 +80,18 @@ void construct_psf_4fold(float z, complex *g)
 //	g[((N - 1) - i)*N+j+N/2] = g_r[j];
 }
 
-// construct the kernel directly inside the FFT call
-__device__
-cufftComplex _psf(void *dataIn, size_t offset, void *callerInfo, void *sharedPtr)
-{
-	// would you need to mod offset by N*N with batch? (probably?)
-	// might be able to do some weird stuff with cufftPlanMany, like stride of 0
-	// (don't want to allocate a batch's worth of empty memory)
-	int i = offset % N;
-	int j = offset / N; // ?
-
-	float x = (i * (float)N/(float)(N-1) - N/2) * DX;
-	float y = (j * (float)N/(float)(N-1) - N/2) * DY;
-	float z = *(float *)&callerInfo;
-
-	float r = -2.f * norm3df(x, y, z) / LAMBDA0;
-
-	// exp(ix) = cos(x) + isin(x)
-	float re, im;
-	sincospif(r, &im, &re);
-
-	// numerical conditioning, probably unnecessary
-	// also corrects the sign flip above
-	r /= -2.f * z / LAMBDA0;
-
-	// re(iz) = -im(z), im(iz) = re(z)
-	cufftComplex g;
-	g.x = -im / r;
-	g.y = re / r;
-
-	return g;
-}
-__device__
-cufftCallbackLoadC d_psf = _psf;
-
 __global__
-void complex_cast(float *x, complex *z)
+void cast_complex(float *x, complex *z)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
 	z[i*N+j].x = x[i*N+j];
+	z[i*N+j].y = 0.f;
 }
 
-//__device__
-//void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
-//{
-//	cufftComplex a, b, c;
-//
-//	a = element;
-//	b = ((cufftComplex*)callerInfo)[offset];
-//
-//	c.x = a.x * b.x - a.y * b.y;
-//	c.y = a.x * b.y + a.y * b.x;
-//
-//	((cufftComplex*)dataOut)[offset] = c;
-//}
-//_device__
-//cufftCallbackStoreC _mul_d = _mul;
-
-//__global__
-//void multiply_inplace(complex *z, complex *w)
-//{
-//	int i = blockIdx.x;
-//	int j = threadIdx.x; // blockDim shall equal N
-//
-//	z[i*N+j] = cuCmulf(z[i*N+j], w[i*N+j]);
-//}
-
 __global__
-void complex_mod(complex *z, float *r)
+void complex_mod(cufftComplex *z, float *r)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
@@ -194,6 +113,22 @@ void frequency_shift(complex *data)
 	data[i*N+j].y *= a;
 }
 
+__device__
+void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
+{
+	cufftComplex a, b, c;
+
+	a = element;
+	b = ((cufftComplex *)callerInfo)[offset];
+
+	c.x = a.x * b.x - a.y * b.y;
+	c.y = a.x * b.y + a.y * b.x;
+
+	((cufftComplex *)dataOut)[offset] = c;
+}
+__device__
+cufftCallbackStoreC d_mul = _mul;
+
 int main(void)
 {
     cudaDeviceReset();
@@ -201,30 +136,69 @@ int main(void)
 	int num_frames = 1;
 	int num_slices = 100;
 	float z_min = 30;
-	float dz = 1;
+	float z_step = 1;
 
-	float z = 50;
+	cufftHandle plan, plan_mul;
+	checkCudaErrors( cufftPlan2d(&plan, N, N, CUFFT_C2C) );
+	checkCudaErrors( cufftPlan2d(&plan_mul, N, N, CUFFT_C2C) );
 
-	cufftHandle plan_psf;
-	checkCudaErrors( cufftPlan2d(&plan_psf, N, N, CUFFT_C2C) );
+	cufftComplex *d_img, *d_psf;
+	checkCudaErrors( cudaMalloc((void **)&d_psf, N*N*sizeof(cufftComplex)) );
+	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(cufftComplex)) );
 
-	cufftComplex *h;
-	checkCudaErrors( cudaMalloc((void **)&h, N*N*sizeof(cufftComplex)) );
+	cufftCallbackStoreC h_mul;
+	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
+	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
 
-	cufftCallbackLoadC h_psf;
-	checkCudaErrors( cudaMemcpyFromSymbol(&h_psf, d_psf, sizeof(cufftCallbackLoadC)) );
-	checkCudaErrors( cufftXtSetCallback(plan_psf, (void **)&h_psf, CUFFT_CB_ST_COMPLEX, (void **)&z) );
-	checkCudaErrors( cufftExecC2C(plan_psf, NULL, h, CUFFT_FORWARD) );
+	float *d_img_real, *d_img_slices;
+	checkCudaErrors( cudaMalloc((void **)&d_img_real, N*N*sizeof(float)) );
+	checkCudaErrors( cudaMalloc((void **)&d_img_slices, num_slices*N*N*sizeof(float)) );
 
-	float *f;
-	checkCudaErrors( cudaMalloc((void **)&f, N*N*sizeof(float)) );
+	float *h_img_slices;
+	checkCudaErrors( cudaMallocHost((void **)&d_img_slices, num_slices*N*N*sizeof(float)) );
 
-	complex_mod<<<N, N>>>(h, f);
-	cv::Mat B(N, N, CV_32FC1);
-	checkCudaErrors( cudaMemcpy(B.data, f, N*N*sizeof(float), cudaMemcpyDeviceToHost) );
-	imshow(B);
+	for (int frame = 0; frame < num_frames; frame++)
+	{
+		cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
+		A.convertTo(A, CV_32FC1);
 
-	cufftDestroy(plan_psf);
+		cudaTimerStart();
+
+		checkCudaErrors( cudaMemcpy(d_img_real, A.data, N*N*sizeof(float), cudaMemcpyHostToDevice) );
+		cast_complex<<<N, N>>>(d_img_real, d_img); // convert this to callback, that's the point of them. could even do char to float directly!
+
+		checkCudaErrors( cufftExecC2C(plan, d_img, d_img, CUFFT_FORWARD) );
+		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
+		// obvious - simple - callback candidate, but would be waste of time
+		frequency_shift<<<N, N>>>(d_img);
+
+		for (int slice = 0; slice < num_slices; slice++)
+		{
+			float z = z_min + z_step * slice;
+
+			// faster to do this than the callback, curiously... need to further investigate shared memory
+			construct_psf_4fold<<<N/2, N/2>>>(z, d_psf);
+
+			// investigate in vs out of place
+			// FFT and multiply
+			checkCudaErrors( cufftExecC2C(plan_mul, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
+
+			checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) );
+			// ordinarily would need to invert phase now, to compensate for earlier (and complete the FFT shift)...
+
+			// ... but since we're just taking the modulus, we don't care about phase
+			complex_mod<<<N, N>>>(d_psf, d_img_slices + slice*N*N); // 0.20s for 100
+		}
+
+		// zero-copy memory in Tegra
+		cudaMemcpy(h_img_slices, d_img_slices, num_slices*N*N*sizeof(float), cudaMemcpyDeviceToHost);
+
+		std::cout << cudaTimerStop() << "ms" << std::endl;
+		// 180ms, AF was something like 130ms... closing in...
+	}
+
+	checkCudaErrors( cufftDestroy(plan) );
+	checkCudaErrors( cufftDestroy(plan_mul) );
 
 	return 0;
 }
