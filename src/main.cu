@@ -1,3 +1,4 @@
+
 /*
  *
  * Proof-of-concept for GPU holographic deconvolution.
@@ -21,6 +22,7 @@
 #include <opencv2/highgui.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
+#include <algorithm>
 
 #include "common.h"
 
@@ -30,6 +32,8 @@
 #define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
 #define SCALE 0.00097751711f // 1/(N-1)
+
+typedef unsigned char byte;
 
 // Convenience method for plotting
 void imshow(cv::Mat in)
@@ -149,7 +153,7 @@ __device__
 cufftCallbackStoreC d_mul = _mul;
 
 __global__
-void byte_to_complex(unsigned char *b, cufftComplex *z)
+void byte_to_complex(byte *b, cufftComplex *z)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
@@ -171,8 +175,9 @@ int main(void)
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 5;
+	int num_frames = 10;
 	int num_slices = 100;
+	int z_half_window = 2;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -193,17 +198,10 @@ int main(void)
 
 	cufftCallbackStoreC h_mul;
 	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
-//	callback_t h_params;
-//	h_params.data = d_img;
-//	h_params.flags = 0;
-//	callback_t *d_params;
-//	checkCudaErrors( cudaMalloc((void **)&d_params, sizeof(callback_t)) );
-//	checkCudaErrors( cudaMemcpy(d_params, &h_params, sizeof(callback_t), cudaMemcpyHostToDevice) );
 	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
-//	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_params) );
 
-	unsigned char *d_img_u8;
-	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(unsigned char)) );
+	byte *d_img_u8;
+	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(byte)) );
 
 	// full-size is necessary for downstream reduction, need the whole cube
 	float *d_slices;
@@ -213,6 +211,13 @@ int main(void)
 	float *h_slices;
 	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(float)) );
 
+	byte *h_query, *d_query;
+	checkCudaErrors( cudaMalloc((void **)&d_query, num_slices*sizeof(byte)));
+	checkCudaErrors( cudaMallocHost((void **)&h_query, num_slices*sizeof(byte)));
+
+	// initially query all slices
+	memset(h_query, 0, num_slices*sizeof(byte));
+
 	for (int frame = 0; frame < num_frames; frame++)
 	{
 		// this would be a copy from a frame buffer on the Tegra
@@ -220,7 +225,7 @@ int main(void)
 
 		cudaTimerStart();
 
-		checkCudaErrors( cudaMemcpy(d_img_u8, A.data, N*N*sizeof(unsigned char), cudaMemcpyHostToDevice) );
+		checkCudaErrors( cudaMemcpy(d_img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
 
 		byte_to_complex<<<N, N>>>(d_img_u8, d_img);
 
@@ -232,10 +237,14 @@ int main(void)
 
 		for (int slice = 0; slice < num_slices; slice++)
 		{
+			// skip the slice if we don't expect anything interesting
+			if (!h_query[slice])
+				continue;
+
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
-			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
+			construct_psf<<<N, N, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftExecC2C(plan_mul, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
@@ -253,12 +262,24 @@ int main(void)
 			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
 		}
 
-		// checkCudaErrors( cudaDeviceSynchronize() );
-
-
-		// now do some reduction to the whole cube...
+		checkCudaErrors( cudaDeviceSynchronize() );
 
 		std::cout << cudaTimerStop() << "ms" << std::endl;
+
+		// now do some reduction to the whole cube...
+		// ...
+
+		// which returns which slices contained objects of interest
+		checkCudaErrors( cudaMemset(d_query, 1, num_slices) ); // for demo purpose, all of them
+		checkCudaErrors( cudaMemcpy(h_query, d_query, num_slices*sizeof(byte), cudaMemcpyDeviceToHost) );
+
+		// for the next frame, query the neighborhoods about each of those
+		// ...
+
+		// ! this is an implicit assumption about the z-velocity of the objects in the sample
+		// picking neighborhood via Kalman filtering would be very cool, but probably overkill
+		// every few frames, just query everything?
+
 		// looking at utilisation, might be able to halve (!!!) that with batching
 	}
 
@@ -284,7 +305,6 @@ int main(void)
 }
 
 /*
-
 typedef struct {
 // int N;
 float lambda0;
@@ -296,7 +316,6 @@ float d_step;
 int n_batch;
 int n_frames;
 } params_t;
-
 // Populates frequency grid and vector of spacings.
 //void setup_vars(params_t params, af::array *grid, af::array *spacings)
 //{
@@ -306,24 +325,19 @@ int n_frames;
 //    *grid = af::tile(af::pow(df * params.del_x, 2), 1, N) + af::tile(af::pow(df * params.del_y, 2).T(), N, 1);
 //    *spacings = af::pow(af::range(af::dim4(n_step)) * params.d_step + params.d_min, 2);
 //}
-
 // Expands input image into slices, performs a reduction, and writes the result out.
 void process_image(params_t params, af::array &img, float *out_ptr, af::array &x_cube) //, af::array &grid, af::array &spacings)
 {
 af::array x(N, N, c32);
-
 // int n_step = spacings.dims(0);
 //    af::cfloat k0 = {0., (float)(-2. * af::Pi / params.lambda0)};
 //    af::cfloat k1 = {0., (float)(1. / params.lambda0)};
 af::cfloat unit = {0, 1};
-
 // FFT the input image
 af::array h_f = af::fft2(img);
 // phase shift it
 h_f = h_f * unit;
-
 int n_step = (params.d_max - params.d_min) / params.d_step;
-
 // process in batches to fit in memory
 // ... but this seems to entirely occupy the Tegra...
 for (int j = 0; j < n_step; j ++)
@@ -337,26 +351,20 @@ x.unlock();
 // x = af::sqrt(grid + params.d_min + i * params.d_step); // ~0.15sec
 // x = k1 * af::exp(k0 * x) / x; // g
 af::fft2InPlace(x); // g_f // 0.3sec
-
 // note here: g is an even function
 // so F(g) is real valued and even
 // (i.e. can I just take FFT of half of g?)
-
 x = x * h_f; // gh_f
 af::ifft2InPlace(x); // h // 0.4sec
 // x = af::shift(x, x.dims(0)/2, x.dims(1)/2); // FFT shift
-
 x_cube(af::span, af::span, j) = af::abs(x); // / af::max<float>(x) * 255.; // compression probably unnecessary?
 }
-
 // simulate doing some reduction operation that returns a single image per cube
 // i.e. find optimal focus -> construct 3D volume
 af::array x_sum = af::sum(x_cube, 2);
-
 // push to host
 x_sum.host(out_ptr);
 }
-
 int main(void)
 {
 // setup experimental parameters
@@ -370,45 +378,36 @@ int main(void)
     params.d_step = 1; // step size in mm
     int N_batch = 1; // number of frames per batch; best performance with 1!?!?
     int N_frames = 3; // currently, just repeats the analysis
-
     // load in test image
     cv::Mat mat = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
     mat.convertTo(mat, CV_32FC1);
-
     // simulate a DMA buffer on the GPU, i.e. feeding in from video camera
     // will copy in the images as part of the main loop, simulate 'streaming'
     float *img_ptr;
     cudaMalloc((void **)&img_ptr, N * N * sizeof(float));
-
     // allocate the matrix using our predefined staging area
     af::array img(N, N, img_ptr, afDevice);
     af::eval(img);
-
     // pin buffer on the host
     float *h_ptr = af::pinned<float>(N * N * N_frames);
-
 //    af::array grid;
 //    af::array spacings;
 //    setup_vars(params, &grid, &spacings);
-
     // allocate this just once and reuse, it's huge
 //    int n_step = spacings.dims(0);
     int n_step = (params.d_max - params.d_min) / params.d_step;
     af::array x_cube(N, N, n_step, f32);
-
     for (int k = 0; k < N_frames; k++)
     {
 // 'copy the image' - these would be successive frames in reality, and would probably live on GPU
 // i.e. this copy would not happen
 // mat = mat + 0.; // no possibility of caching
 cudaMemcpy(img_ptr, mat.data, N * N * sizeof(float), cudaMemcpyHostToDevice);
-
 // expand the image into slices, do a reduction, save result to h_ptr
 af::timer::start();
 process_image(params, img, h_ptr + N * N * k, x_cube); //, grid, spacings);
 std::cout << af::timer::stop() << std::endl;
     }
-
     cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
     for (int i = 0; i < n_step; i++)
     {
@@ -417,8 +416,6 @@ std::cout << af::timer::stop() << std::endl;
         cv::imshow("Display window", mat); // Show our image inside it.
         cv::waitKey(0);
     }
-
     return 0;
 }
-
 */
