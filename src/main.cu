@@ -190,7 +190,7 @@ int main(int argc, char *argv[])
 
 	// the batch causes messed up writes, or data conflicts... ?!?!
 	cufftHandle plan, plan_mul;
-	int batch_size = 2;
+	int batch_size = 4;
 	int dims[] = {N, N};
 	checkCudaErrors( cufftPlanMany(&plan, 2, dims, \
 			NULL, 1, 0, \
