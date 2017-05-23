@@ -20,7 +20,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-#include <opencv2/gpu/gpu.hpp>
+//#include <opencv2/gpu/gpu.hpp>
+#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -47,7 +48,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::gpu::GpuMat in)
+void imshow(cv::cuda::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -137,13 +138,15 @@ void frequency_shift(cufftComplex *data)
 // which doesn't make sense, all threads take same path
 // it wasn't, which is good, sort of... turns out the *struct* was the issue
 
+texture<float2> tex_ref;
 __device__
 void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
 {
 	cufftComplex a, b, c;
 
 	a = element;
-	b = ((cufftComplex *)callerInfo)[offset];
+//	b = ((cufftComplex *)callerInfo)[offset];
+	b = (cufftComplex)tex1Dfetch(tex_ref, offset);
 
 	// don't use intrinsics here, this is fastest
 	c.x = a.x * b.x - a.y * b.y;
@@ -173,13 +176,12 @@ void complex_modulus(cufftComplex *z, float *r)
 	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
 	int num_frames = 10;
 	int num_slices = 100;
-	int z_half_window = 2;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -197,6 +199,10 @@ int main(void)
 	cufftComplex *d_img, *d_psf;
 	checkCudaErrors( cudaMalloc((void **)&d_psf, N*N*sizeof(cufftComplex)) );
 	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(cufftComplex)) );
+
+	const textureReference* tex_ref_ptr;
+	cudaGetTextureReference(&tex_ref_ptr, &tex_ref);
+	cudaChannelFormatDesc tex_desc = cudaCreateChannelDesc<float2>();
 
 	cufftCallbackStoreC h_mul;
 	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
@@ -237,6 +243,9 @@ int main(void)
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N>>>(d_img);
 
+		// bind to texture
+		checkCudaErrors( cudaBindTexture(NULL, tex_ref_ptr, d_img, &tex_desc) );
+
 		for (int slice = 0; slice < num_slices; slice++)
 		{
 			// skip the slice if we don't expect anything interesting
@@ -264,6 +273,8 @@ int main(void)
 			cudaStreamSynchronize(math_stream);
 			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
 		}
+
+//		checkCudaErrors( cudaUnbindTexture(&tex_ref) );
 
 		checkCudaErrors( cudaDeviceSynchronize() );
 
