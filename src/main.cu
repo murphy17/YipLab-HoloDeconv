@@ -20,9 +20,12 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
+//#include <opencv2/core/cuda.hpp>
+#include <opencv2/gpu/gpu.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
+#include <cuda_fp16.h>
 
 #include "common.h"
 
@@ -46,7 +49,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::cuda::GpuMat in)
+void imshow(cv::gpu::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -68,7 +71,7 @@ void imshow(cv::cuda::GpuMat in)
 // exploits 4-fold symmetry (PSF is also radially symmetric, but that's harder...)
 // note that answer is scaled between +/-1
 __global__
-void construct_psf(float z, cufftComplex *g, float norm)
+void construct_psf(float z, half2 *g, float norm)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
@@ -96,38 +99,28 @@ void construct_psf(float z, cufftComplex *g, float norm)
 	g_ij.x = __fdividef(-im, r); // im, r);
 	g_ij.y = __fdividef(re, r);
 
-	// I'm really skeptical about the memory access here
-	// but when I tried shared memory it was slower
-	g[i*N+j] = g_ij;
-	g[i*N+jj] = g_ij;
-	g[ii*N+j] = g_ij;
-	g[ii*N+jj] = g_ij;
+	// cast to half-precision
+	half2 g_ij_fp16 = __floats2half2_rn(g_ij.x, g_ij.y);
 
-	// this is slower!?!?!?!?!
-	// write the half-row
-//	__shared__ cuComplex g_r[N/2];
-//	g[i*N+j] = g_ij;
-//	g[((N - 1) - i)*N+j] = g_ij;
-//	// flip the half-row
-//	g_r[(N/2 - 1) - j] = g_ij; // bank conflicts? can't avoid I think
-//	__syncthreads(); // needed?
-//	// write the flipped half-row
-//	g[i*N+j+N/2] = g_r[j];
-//	g[((N - 1) - i)*N+j+N/2] = g_r[j];
+	// I'm really skeptical about the memory access here - each seems around 2.5ms
+	// but when I tried shared memory it was slower
+	g[i*N+j] = g_ij_fp16;
+	g[i*N+jj] = g_ij_fp16;
+	g[ii*N+j] = g_ij_fp16;
+	g[ii*N+jj] = g_ij_fp16;
 }
 
 // exploit Fourier duality to shift without copying
 // credit to http://www.orangeowlsolutions.com/archives/251
 __global__
-void frequency_shift(cufftComplex *data)
+void frequency_shift(half2 *data)
 {
     int i = blockIdx.x;
     int j = threadIdx.x;
 
 	float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
 
-	data[i*N+j].x *= a;
-	data[i*N+j].y *= a;
+	data[i*N+j] = __hmul2(data[i*N+j], __float2half2_rn(a));
 }
 
 // it seems you can't have too many plans simultaneously.
@@ -136,40 +129,71 @@ void frequency_shift(cufftComplex *data)
 // which doesn't make sense, all threads take same path
 // it wasn't, which is good, sort of... turns out the *struct* was the issue
 
+// this will have an out-of-bounds error... unless you allocate an extra element
 __device__
 void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
 {
-	cufftComplex a, b, c;
+	half2 a, b;
 
-	a = element;
-	b = ((cufftComplex *)callerInfo)[offset];
+	a = *(half2 *)&element;
+	b = ((half2 *)callerInfo)[offset];
 
 	// don't use intrinsics here, this is fastest
-	c.x = a.x * b.x - a.y * b.y;
-	c.y = a.x * b.y + a.y * b.x;
+//	c.x = a.x * b.x - a.y * b.y;
+//	c.y = a.x * b.y + a.y * b.x;
 
-	((cufftComplex *)dataOut)[offset] = c;
+	half2 temp = __hmul2(a, b);
+	half c_x = __hadd(((half *)&temp)[0], __hneg(((half *)&temp)[1]));
+
+	temp = __hmul2(a, __lowhigh2highlow(b));
+	half c_y = __hadd(((half *)&temp)[0], ((half *)&temp)[1]);
+
+	((half2 *)dataOut)[offset] = __halves2half2(c_x, c_y);
 }
 __device__
 cufftCallbackStoreC d_mul = _mul;
 
 __global__
-void byte_to_complex(byte *b, cufftComplex *z)
+void byte_to_complex(byte *b, half2 *z)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
-	z[i*N+j].x = ((float)(b[i*N+j])) / 255.f;
-	z[i*N+j].y = 0.f;
+	z[i*N+j] = __floats2half2_rn(((float)(b[i*N+j])) / 255.f, 0.f);
 }
 
 __global__
-void complex_modulus(cufftComplex *z, float *r)
+void complex_modulus(half2 *z, float *r)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
-	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
+	half2 temp = __hmul2(z[i*N+j], z[i*N+j]);
+	r[i*N+j] = __half2float(__hadd(((half *)&temp)[0], ((half *)&temp)[1]));
+}
+
+__global__
+void multiply_filter(half2 *z, half2 *w)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	half2 a, b;
+
+	a = z[i*N+j];
+	b = w[i*N+j];
+
+	// don't use intrinsics here, this is fastest
+//	c.x = a.x * b.x - a.y * b.y;
+//	c.y = a.x * b.y + a.y * b.x;
+
+	half2 temp = __hmul2(a, b);
+	half c_x = __hadd(((half *)&temp)[0], __hneg(((half *)&temp)[1]));
+
+	temp = __hmul2(a, __lowhigh2highlow(b));
+	half c_y = __hadd(((half *)&temp)[0], ((half *)&temp)[1]);
+
+	z[i*N+j] = __halves2half2(c_x, c_y);
 }
 
 int main(void)
@@ -178,7 +202,6 @@ int main(void)
 
 	int num_frames = 10;
 	int num_slices = 100;
-	int z_half_window = 2;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -186,20 +209,30 @@ int main(void)
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
-	cufftHandle plan, plan_mul;
-	checkCudaErrors( cufftPlan2d(&plan, N, N, CUFFT_C2C) );
-	checkCudaErrors( cufftPlan2d(&plan_mul, N, N, CUFFT_C2C) );
-
+	// the multiply callback was throwing invalid type error...
+	cufftHandle plan;
+	long long dims[] = {N, N};
+	size_t work_sizes;
+	checkCudaErrors( cufftCreate(&plan) );
+//	checkCudaErrors( cufftCreate(&plan_mul) );
+	checkCudaErrors( cufftXtMakePlanMany(plan, 2, dims, \
+			NULL, 1, N*N, CUDA_C_16F, \
+			NULL, 1, N*N, CUDA_C_16F, \
+			1, &work_sizes, CUDA_C_16F) );
+//	checkCudaErrors( cufftXtMakePlanMany(plan_mul, 2, dims, \
+//			NULL, 1, N*N, CUDA_C_16F, \
+//			NULL, 1, N*N, CUDA_C_16F, \
+//			1, &work_sizes, CUDA_C_16F) );
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
-	checkCudaErrors( cufftSetStream(plan_mul, math_stream) );
+//	checkCudaErrors( cufftSetStream(plan_mul, math_stream) );
 
-	cufftComplex *d_img, *d_psf;
-	checkCudaErrors( cudaMalloc((void **)&d_psf, N*N*sizeof(cufftComplex)) );
-	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(cufftComplex)) );
+	half2 *d_img, *d_psf;
+	checkCudaErrors( cudaMalloc((void **)&d_psf, N*N*sizeof(half2)) );
+	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(half2)) );
 
-	cufftCallbackStoreC h_mul;
-	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
-	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
+//	cufftCallbackStoreC h_mul;
+//	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
+//	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
 
 	byte *d_img_u8;
 	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(byte)) );
@@ -230,7 +263,10 @@ int main(void)
 
 		byte_to_complex<<<N, N>>>(d_img_u8, d_img);
 
-		checkCudaErrors( cufftExecC2C(plan, d_img, d_img, CUFFT_FORWARD) );
+		complex_modulus<<<N, N, 0, math_stream>>>(d_psf, d_slices); // no need to sync streams, full-size buffer
+		imshow(cv::gpu::GpuMat(N, N, CV_32FC1, d_slices));
+
+		checkCudaErrors( cufftXtExec(plan, d_img, d_img, CUFFT_FORWARD) );
 		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing a plan
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
@@ -248,10 +284,12 @@ int main(void)
 			construct_psf<<<N, N, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
-			checkCudaErrors( cufftExecC2C(plan_mul, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
+			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
+
+			multiply_filter<<<N, N, 0, math_stream>>>(d_psf, d_img);
 
 			// inverse FFT that product
-			checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) ); // doing the mod in here shaves off ~15ms
+			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_INVERSE) ); // doing the mod in here shaves off ~15ms
 
 			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 
@@ -284,11 +322,11 @@ int main(void)
 		// looking at utilisation, might be able to halve (!!!) that with batching
 	}
 
-//	for (int slice = 0; slice < num_slices; slice++)
-//	{
-//		cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
-//		imshow(B);
-//	}
+	for (int slice = 0; slice < num_slices; slice++)
+	{
+		cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
+		imshow(B);
+	}
 
 	checkCudaErrors( cudaFree(d_img) );
 	checkCudaErrors( cudaFree(d_img_u8) );
@@ -297,7 +335,7 @@ int main(void)
 	checkCudaErrors( cudaFreeHost(h_slices) );
 
 	checkCudaErrors( cufftDestroy(plan) );
-	checkCudaErrors( cufftDestroy(plan_mul) );
+//	checkCudaErrors( cufftDestroy(plan_mul) );
 
 	checkCudaErrors( cudaStreamDestroy(math_stream) );
 	checkCudaErrors( cudaStreamDestroy(copy_stream) );
