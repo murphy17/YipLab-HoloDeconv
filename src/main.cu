@@ -180,7 +180,6 @@ int main(int argc, char* argv[])
 
 	int num_frames = 10;
 	int num_slices = 100;
-	int z_half_window = 2;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -188,9 +187,19 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
+	long long dims[] = {N, N};
+	size_t work_sizes = 0;
 	cufftHandle plan, plan_mul;
-	checkCudaErrors( cufftPlan2d(&plan, N, N, CUFFT_C2C) );
-	checkCudaErrors( cufftPlan2d(&plan_mul, N, N, CUFFT_C2C) );
+	cufftCreate(&plan);
+	cufftCreate(&plan_mul);
+	checkCudaErrors( cufftXtMakePlanMany(plan, 2, dims, \
+			NULL, 1, 0, CUDA_C_32F, \
+			NULL, 1, 0, CUDA_C_32F, \
+			1, &work_sizes, CUDA_C_32F) );
+	checkCudaErrors( cufftXtMakePlanMany(plan_mul, 2, dims, \
+			NULL, 1, 0, CUDA_C_32F, \
+			NULL, 1, 0, CUDA_C_32F, \
+			1, &work_sizes, CUDA_C_32F) );
 
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
 	checkCudaErrors( cufftSetStream(plan_mul, math_stream) );
@@ -250,10 +259,10 @@ int main(int argc, char* argv[])
 			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
-			checkCudaErrors( cufftExecC2C(plan_mul, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
+			checkCudaErrors( cufftXtExec(plan_mul, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
 
 			// inverse FFT that product
-			checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) ); // doing the mod in here shaves off ~15ms
+			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_INVERSE) ); // doing the mod in here shaves off ~15ms
 
 			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 
