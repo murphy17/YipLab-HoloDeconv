@@ -286,11 +286,14 @@ int main(void)
 		// looking at utilisation, might be able to halve (!!!) that with batching
 	}
 
-//	for (int slice = 0; slice < num_slices; slice++)
-//	{
-//		cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
-//		imshow(B);
-//	}
+	if (argc == 2)
+	{
+		for (int slice = 0; slice < num_slices; slice++)
+		{
+			cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
+			imshow(B);
+		}
+	}
 
 	checkCudaErrors( cudaFree(d_img) );
 	checkCudaErrors( cudaFree(d_img_u8) );
