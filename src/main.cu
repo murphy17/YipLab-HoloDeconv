@@ -298,6 +298,7 @@ int main(void)
 
 			// it's actually faster to async each slice, surprisingly
 			// could use just a single image for buffer, stream sync was negligible last I checked
+			cudaStreamSynchronize(math_stream);
 			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
 		}
 
