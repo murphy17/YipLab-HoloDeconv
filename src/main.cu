@@ -20,7 +20,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-#include <opencv2/gpu/gpu.hpp>
+//#include <opencv2/gpu/gpu.hpp>
+#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -47,7 +48,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::gpu::GpuMat in)
+void imshow(cv::cuda::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
