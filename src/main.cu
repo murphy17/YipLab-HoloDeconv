@@ -20,8 +20,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-//#include <opencv2/core/cuda.hpp>
-#include <opencv2/gpu/gpu.hpp>
+#include <opencv2/core/cuda.hpp>
+//#include <opencv2/gpu/gpu.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -49,7 +49,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::gpu::GpuMat in)
+void imshow(cv::cuda::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -162,6 +162,16 @@ void byte_to_complex(byte *b, half2 *z)
 	z[i*N+j] = __floats2half2_rn(((float)(b[i*N+j])) / 255.f, 0.f);
 }
 
+//__global__
+//void byte_to_half_to_float(byte *b, float *f)
+//{
+//	int i = blockIdx.x;
+//	int j = threadIdx.x; // blockDim shall equal N
+//
+//	half h = __float2half(((float)(b[i*N+j])) / 255.f);
+//	f[i*N+j] = __half2float(h);
+//}
+
 __global__
 void complex_modulus(half2 *z, float *r)
 {
@@ -169,7 +179,11 @@ void complex_modulus(half2 *z, float *r)
 	int j = threadIdx.x; // blockDim shall equal N
 
 	half2 temp = __hmul2(z[i*N+j], z[i*N+j]);
-	r[i*N+j] = __half2float(__hadd(((half *)&temp)[0], ((half *)&temp)[1]));
+	r[i*N+j] = __half2float(__hadd(__high2half(temp), __low2half(temp)));
+
+	// I'm a bit concerned about how those intrinsics expand
+	// too many instructions seems likely
+	// write your own?
 }
 
 __global__
@@ -183,15 +197,11 @@ void multiply_filter(half2 *z, half2 *w)
 	a = z[i*N+j];
 	b = w[i*N+j];
 
-	// don't use intrinsics here, this is fastest
-//	c.x = a.x * b.x - a.y * b.y;
-//	c.y = a.x * b.y + a.y * b.x;
-
 	half2 temp = __hmul2(a, b);
-	half c_x = __hadd(((half *)&temp)[0], __hneg(((half *)&temp)[1]));
+	half c_x = __hadd(__high2half(temp), __low2half(temp));
 
 	temp = __hmul2(a, __lowhigh2highlow(b));
-	half c_y = __hadd(((half *)&temp)[0], ((half *)&temp)[1]);
+	half c_y = __hadd(__high2half(temp), __low2half(temp));
 
 	z[i*N+j] = __halves2half2(c_x, c_y);
 }
@@ -200,7 +210,7 @@ int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 10;
+	int num_frames = 5;
 	int num_slices = 100;
 	float z_min = 30;
 	float z_step = 1;
@@ -212,27 +222,17 @@ int main(int argc, char* argv[])
 	// the multiply callback was throwing invalid type error...
 	cufftHandle plan;
 	long long dims[] = {N, N};
-	size_t work_sizes;
+	size_t work_sizes = 0;
 	checkCudaErrors( cufftCreate(&plan) );
-//	checkCudaErrors( cufftCreate(&plan_mul) );
 	checkCudaErrors( cufftXtMakePlanMany(plan, 2, dims, \
-			NULL, 1, N*N, CUDA_C_16F, \
-			NULL, 1, N*N, CUDA_C_16F, \
+			NULL, 1, 0, CUDA_C_16F, \
+			NULL, 1, 0, CUDA_C_16F, \
 			1, &work_sizes, CUDA_C_16F) );
-//	checkCudaErrors( cufftXtMakePlanMany(plan_mul, 2, dims, \
-//			NULL, 1, N*N, CUDA_C_16F, \
-//			NULL, 1, N*N, CUDA_C_16F, \
-//			1, &work_sizes, CUDA_C_16F) );
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
-//	checkCudaErrors( cufftSetStream(plan_mul, math_stream) );
 
 	half2 *d_img, *d_psf;
 	checkCudaErrors( cudaMalloc((void **)&d_psf, N*N*sizeof(half2)) );
 	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(half2)) );
-
-//	cufftCallbackStoreC h_mul;
-//	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
-//	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
 
 	byte *d_img_u8;
 	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(byte)) );
@@ -245,13 +245,6 @@ int main(int argc, char* argv[])
 	float *h_slices;
 	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(float)) );
 
-	byte *h_query, *d_query;
-	checkCudaErrors( cudaMalloc((void **)&d_query, num_slices*sizeof(byte)));
-	checkCudaErrors( cudaMallocHost((void **)&h_query, num_slices*sizeof(byte)));
-
-	// initially query all slices
-	memset(h_query, 0, num_slices*sizeof(byte));
-
 	for (int frame = 0; frame < num_frames; frame++)
 	{
 		// this would be a copy from a frame buffer on the Tegra
@@ -263,33 +256,29 @@ int main(int argc, char* argv[])
 
 		byte_to_complex<<<N, N>>>(d_img_u8, d_img);
 
-		complex_modulus<<<N, N, 0, math_stream>>>(d_psf, d_slices); // no need to sync streams, full-size buffer
-		imshow(cv::gpu::GpuMat(N, N, CV_32FC1, d_slices));
-
 		checkCudaErrors( cufftXtExec(plan, d_img, d_img, CUFFT_FORWARD) );
 		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing a plan
+
+		// problem with 16-bit FFT - the order of magnitude varies by like 5
+		// can I truncate?
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N>>>(d_img);
 
 		for (int slice = 0; slice < num_slices; slice++)
 		{
-			// skip the slice if we don't expect anything interesting
-			if (!h_query[slice])
-				continue;
-
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
 			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
-			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
+			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! ~40%
 
-			multiply_filter<<<N, N, 0, math_stream>>>(d_psf, d_img);
+			multiply_filter<<<N, N, 0, math_stream>>>(d_psf, d_img); // hold off FP16 callback until FFT working
 
 			// inverse FFT that product
-			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_INVERSE) ); // doing the mod in here shaves off ~15ms
+			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_INVERSE) );
 
 			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 
@@ -310,8 +299,8 @@ int main(int argc, char* argv[])
 		// ...
 
 		// which returns which slices contained objects of interest
-		checkCudaErrors( cudaMemset(d_query, 1, num_slices) ); // for demo purpose, all of them
-		checkCudaErrors( cudaMemcpy(h_query, d_query, num_slices*sizeof(byte), cudaMemcpyDeviceToHost) );
+//		checkCudaErrors( cudaMemset(d_query, 1, num_slices) ); // for demo purpose, all of them
+//		checkCudaErrors( cudaMemcpy(h_query, d_query, num_slices*sizeof(byte), cudaMemcpyDeviceToHost) );
 
 		// for the next frame, query the neighborhoods about each of those
 		// ...
