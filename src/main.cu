@@ -105,6 +105,7 @@ void construct_psf(float z, cufftComplex *g, float norm)
 
 	// this is slower!?!?!?!?!
 	// write the half-row
+//	__shared__ cuComplex g_r[N/2];
 //	g[i*N+j] = g_ij;
 //	g[((N - 1) - i)*N+j] = g_ij;
 //	// flip the half-row
@@ -283,11 +284,11 @@ int main(void)
 		// looking at utilisation, might be able to halve (!!!) that with batching
 	}
 
-	for (int slice = 0; slice < num_slices; slice++)
-	{
-		cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
-		imshow(B);
-	}
+//	for (int slice = 0; slice < num_slices; slice++)
+//	{
+//		cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
+//		imshow(B);
+//	}
 
 	checkCudaErrors( cudaFree(d_img) );
 	checkCudaErrors( cudaFree(d_img_u8) );
