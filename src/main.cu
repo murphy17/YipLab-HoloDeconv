@@ -20,6 +20,7 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/gpu/gpu.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -46,7 +47,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::cuda::GpuMat in)
+void imshow(cv::gpu::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -245,7 +246,7 @@ int main(void)
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
-			construct_psf<<<N, N, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
+			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftExecC2C(plan_mul, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
