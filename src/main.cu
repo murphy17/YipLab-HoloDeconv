@@ -173,7 +173,7 @@ void complex_modulus(cufftComplex *z, float *r)
 	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
 }
 
-int main(void)
+int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
