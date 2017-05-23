@@ -196,7 +196,7 @@ void multiply_filter(half2 *z, half2 *w)
 	z[i*N+j] = __halves2half2(c_x, c_y);
 }
 
-int main(void)
+int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
@@ -323,10 +323,13 @@ int main(void)
 		// looking at utilisation, might be able to halve (!!!) that with batching
 	}
 
-	for (int slice = 0; slice < num_slices; slice++)
+	if (argc == 2)
 	{
-		cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
-		imshow(B);
+		for (int slice = 0; slice < num_slices; slice++)
+		{
+			cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
+			imshow(B);
+		}
 	}
 
 	checkCudaErrors( cudaFree(d_img) );
