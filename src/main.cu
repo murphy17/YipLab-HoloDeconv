@@ -281,7 +281,7 @@ int main(void)
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
-			construct_psf<<<N, N, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
+			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! 1.4ms -> 0.8ms
