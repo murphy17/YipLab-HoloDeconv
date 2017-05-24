@@ -125,30 +125,28 @@ void frequency_shift(cufftComplex *data)
 // which doesn't make sense, all threads take same path
 // it wasn't, which is good, sort of... turns out the *struct* was the issue
 
-__device__
+__device__ __forceinline__
 void _mul(void *dataOut, size_t offset, cufftComplex a, void *callerInfo, void *sharedPtr)
 {
 	float bx = ((cufftComplex *)callerInfo)[offset].x;
 	float by = ((cufftComplex *)callerInfo)[offset].y;
 
-	asm(".reg .f32 ay_by;\n" // float ay_by
-		".reg .f32 ay_bx;\n" // float ay_bx
-		" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
-		" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
-		" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
-		" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
-		" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
-		"+f"(by), "+f"(bx) : \
-		"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
+//	asm(".reg .f32 ay_by;\n" // float ay_by
+//		".reg .f32 ay_bx;\n" // float ay_bx
+//		" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
+//		" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
+//		" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
+//		" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
+//		" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
+//		"+f"(by), "+f"(bx) : \
+//		"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
 
-//	float a_temp = a.y;
-//	float bx = ((cufftComplex *)callerInfo)[offset].x;
-//	float by = ((cufftComplex *)callerInfo)[offset].y;
-//	float ay_by = __fmul_rn(a_temp, by);
-//	float ay_bx = __fmul_rn(a_temp, bx);
-//	a_temp = a.x;
-//	bx = __fmaf_rn(a_temp, bx, -ay_by);
-//	by = __fmaf_rn(a_temp, by, ay_bx);
+	float a_temp = a.y;
+	float ay_by = __fmul_rn(a_temp, by);
+	float ay_bx = __fmul_rn(a_temp, bx);
+	a_temp = a.x;
+	bx = __fmaf_rn(a_temp, bx, -ay_by);
+	by = __fmaf_rn(a_temp, by, ay_bx);
 
 	((cufftComplex *)dataOut)[offset].x = bx;
 	((cufftComplex *)dataOut)[offset].y = by;
