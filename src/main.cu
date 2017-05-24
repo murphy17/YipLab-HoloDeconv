@@ -20,11 +20,12 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-//#include <opencv2/gpu/gpu.hpp>
-#include <opencv2/core/cuda.hpp>
+#include <opencv2/gpu/gpu.hpp>
+//#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
+#include <cuda_fp16.h>
 
 #include "common.h"
 
@@ -48,7 +49,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::cuda::GpuMat in)
+void imshow(cv::gpu::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -72,11 +73,11 @@ void imshow(cv::cuda::GpuMat in)
 __global__
 void construct_psf(float z, cufftComplex *g, float norm)
 {
-	int i = blockIdx.x;
-	int j = threadIdx.x; // blockDim shall equal N
+	const int i = blockIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
 
-	int ii = (N - 1) - i;
-	int jj = (N - 1) - j;
+	const int ii = (N - 1) - i;
+	const int jj = (N - 1) - j;
 
 	// not sure whether the expansion of N/(N-1) was necessary
 	float x = (i * SCALE + i - N/2) * DX;
@@ -98,24 +99,11 @@ void construct_psf(float z, cufftComplex *g, float norm)
 	g_ij.x = __fdividef(-im, r); // im, r);
 	g_ij.y = __fdividef(re, r);
 
-	// I'm really skeptical about the memory access here
-	// but when I tried shared memory it was slower
+	// CUDA takes care of coalescing the reversed access, this is fine
 	g[i*N+j] = g_ij;
 	g[i*N+jj] = g_ij;
 	g[ii*N+j] = g_ij;
 	g[ii*N+jj] = g_ij;
-
-	// this is slower!?!?!?!?!
-	// write the half-row
-//	__shared__ cuComplex g_r[N/2];
-//	g[i*N+j] = g_ij;
-//	g[((N - 1) - i)*N+j] = g_ij;
-//	// flip the half-row
-//	g_r[(N/2 - 1) - j] = g_ij; // bank conflicts? can't avoid I think
-//	__syncthreads(); // needed?
-//	// write the flipped half-row
-//	g[i*N+j+N/2] = g_r[j];
-//	g[((N - 1) - i)*N+j+N/2] = g_r[j];
 }
 
 // exploit Fourier duality to shift without copying
@@ -123,10 +111,10 @@ void construct_psf(float z, cufftComplex *g, float norm)
 __global__
 void frequency_shift(cufftComplex *data)
 {
-    int i = blockIdx.x;
-    int j = threadIdx.x;
+    const int i = blockIdx.x;
+    const int j = threadIdx.x;
 
-	float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
+	const float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
 
 	data[i*N+j].x *= a;
 	data[i*N+j].y *= a;
@@ -139,18 +127,25 @@ void frequency_shift(cufftComplex *data)
 // it wasn't, which is good, sort of... turns out the *struct* was the issue
 
 __device__
-void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
+void _mul(void *dataOut, size_t offset, cufftComplex a, void *callerInfo, void *sharedPtr)
 {
-	cufftComplex a, b, c;
+//	__half2 val;
+//	asm("{.reg .f16 low,high;\n"
+//	   "  mov.b32 {low,high}, %1;\n"
+//	   "  mov.b32 %0, {high,low};}\n" : "=r"(val.x) : "r"(lh.x));
+//	return val;
 
-	a = element;
-	b = ((cufftComplex *)callerInfo)[offset];
+	float a_temp = a.y;
+	float bx = ((cufftComplex *)callerInfo)[offset].x;
+	float by = ((cufftComplex *)callerInfo)[offset].y;
+	float ay_by = __fmul_rn(a_temp, by);
+	float ay_bx = __fmul_rn(a_temp, bx);
+	a_temp = a.x;
+	float cx = __fmaf_rn(a_temp, bx, -ay_by);
+	float cy = __fmaf_rn(a_temp, by, ay_bx);
 
-	// don't use intrinsics here, this is fastest
-	c.x = a.x * b.x - a.y * b.y;
-	c.y = a.x * b.y + a.y * b.x;
-
-	((cufftComplex *)dataOut)[offset] = c;
+	((cufftComplex *)dataOut)[offset].x = cx;
+	((cufftComplex *)dataOut)[offset].y = cy;
 }
 __device__
 cufftCallbackStoreC d_mul = _mul;
@@ -158,8 +153,8 @@ cufftCallbackStoreC d_mul = _mul;
 __global__
 void byte_to_complex(byte *b, cufftComplex *z)
 {
-	int i = blockIdx.x;
-	int j = threadIdx.x; // blockDim shall equal N
+	const int i = blockIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
 
 	z[i*N+j].x = ((float)(b[i*N+j])) / 255.f;
 	z[i*N+j].y = 0.f;
@@ -168,8 +163,8 @@ void byte_to_complex(byte *b, cufftComplex *z)
 __global__
 void complex_modulus(cufftComplex *z, float *r)
 {
-	int i = blockIdx.x;
-	int j = threadIdx.x; // blockDim shall equal N
+	const int i = blockIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
 
 	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
 }
@@ -178,7 +173,7 @@ int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 10;
+	int num_frames = 5;
 	int num_slices = 100;
 	float z_min = 30;
 	float z_step = 1;
@@ -223,19 +218,10 @@ int main(int argc, char* argv[])
 	float *h_slices;
 	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(float)) );
 
-	byte *h_query, *d_query;
-	checkCudaErrors( cudaMalloc((void **)&d_query, num_slices*sizeof(byte)));
-	checkCudaErrors( cudaMallocHost((void **)&h_query, num_slices*sizeof(byte)));
-
-	// initially query all slices
-	memset(h_query, 0, num_slices*sizeof(byte));
-
 	for (int frame = 0; frame < num_frames; frame++)
 	{
 		// this would be a copy from a frame buffer on the Tegra
 		cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
-
-		cudaTimerStart();
 
 		checkCudaErrors( cudaMemcpy(d_img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
 
@@ -249,10 +235,6 @@ int main(int argc, char* argv[])
 
 		for (int slice = 0; slice < num_slices; slice++)
 		{
-			// skip the slice if we don't expect anything interesting
-			if (!h_query[slice])
-				continue;
-
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
@@ -275,26 +257,13 @@ int main(int argc, char* argv[])
 			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
 		}
 
-		checkCudaErrors( cudaDeviceSynchronize() );
-
-		std::cout << cudaTimerStop() << "ms" << std::endl;
-
-		// now do some reduction to the whole cube...
-		// ...
-
-		// which returns which slices contained objects of interest
-		checkCudaErrors( cudaMemset(d_query, 1, num_slices) ); // for demo purpose, all of them
-		checkCudaErrors( cudaMemcpy(h_query, d_query, num_slices*sizeof(byte), cudaMemcpyDeviceToHost) );
-
-		// for the next frame, query the neighborhoods about each of those
-		// ...
-
-		// ! this is an implicit assumption about the z-velocity of the objects in the sample
-		// picking neighborhood via Kalman filtering would be very cool, but probably overkill
-		// every few frames, just query everything?
-
-		// looking at utilisation, might be able to halve (!!!) that with batching
+		if (frame == 0)
+			cudaTimerStart();
 	}
+
+	checkCudaErrors( cudaDeviceSynchronize() );
+
+	std::cout << cudaTimerStop() / (num_frames - 1) << "ms" << std::endl;
 
 	if (argc == 2)
 	{
