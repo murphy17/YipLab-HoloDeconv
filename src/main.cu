@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cuda_fp16.h>
 
+#include "half.hpp"
 #include "common.h"
 
 #define N 1024
@@ -163,13 +164,13 @@ void byte_to_complex(byte *b, half2 *z)
 }
 
 __global__
-void complex_modulus(half2 *z, float *r)
+void complex_modulus(half2 *z, half *r)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
 	half2 temp = __hmul2(z[i*N+j], z[i*N+j]); // this might saturate
-	r[i*N+j] = __half2float(__hadd(__low2half(temp), __high2half(temp)));
+	r[i*N+j] = __hadd(__low2half(temp), __high2half(temp));
 
 	// I'm a bit concerned about how those intrinsics expand
 	// too many instructions seems likely
@@ -255,12 +256,12 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(byte)) );
 
 	// full-size is necessary for downstream reduction, need the whole cube
-	float *d_slices;
-	checkCudaErrors( cudaMalloc((void **)&d_slices, num_slices*N*N*sizeof(float)) );
+	half *d_slices;
+	checkCudaErrors( cudaMalloc((void **)&d_slices, num_slices*N*N*sizeof(half)) );
 
 	// wouldn't exist in streaming application
-	float *h_slices;
-	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(float)) );
+	half_float::half *h_slices;
+	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(half)) );
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
@@ -276,8 +277,6 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cufftXtExec(plan, d_img, d_img, CUFFT_FORWARD) );
 		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing a plan
 
-		normalize_by<<<N, N>>>(d_img, N);
-
 		// TODO: do the image FFT in 32-bit, then cast to 16-bit
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
@@ -292,13 +291,10 @@ int main(int argc, char* argv[])
 			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0 / N); // speedup with shared memory?
 
 			// normalization is absolutely necessary. done in above
-//			normalize_by<<<N, N>>>(d_psf, N);
+			normalize_by<<<N, N>>>(d_psf, N);
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! ~40%
-
-//			complex_modulus<<<N, N>>>(d_psf, d_slices); // no need to sync streams, full-size buffer
-//			imshow(cv::cuda::GpuMat(N, N, CV_32FC1, d_slices));
 
 			multiply_filter<<<N, N, 0, math_stream>>>(d_psf, d_img); // hold off FP16 callback until FFT working
 
@@ -313,7 +309,8 @@ int main(int argc, char* argv[])
 			// it's actually faster to async each slice, surprisingly
 			// could use just a single image for buffer, stream sync was negligible last I checked
 			cudaStreamSynchronize(math_stream);
-			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
+			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(half), \
+				cudaMemcpyDeviceToHost, copy_stream) );
 		}
 
 		if (frame == 0)
@@ -328,7 +325,8 @@ int main(int argc, char* argv[])
 	{
 		for (int slice = 0; slice < num_slices; slice++)
 		{
-			cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
+			cv::Mat B(N, N, CV_32FC1);
+			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((h_slices + N*N*slice)[i]); }
 			imshow(B);
 		}
 	}
