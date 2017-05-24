@@ -20,8 +20,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-//#include <opencv2/core/cuda.hpp>
-#include <opencv2/gpu/gpu.hpp>
+#include <opencv2/core/cuda.hpp>
+//#include <opencv2/gpu/gpu.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -36,6 +36,7 @@
 #define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
 #define SCALE 0.00097751711f // 1/(N-1)
+#define NUM_SLICES 100 //100
 
 typedef unsigned char byte;
 
@@ -50,7 +51,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::gpu::GpuMat in)
+void imshow(cv::cuda::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -124,13 +125,6 @@ void frequency_shift(half2 *data)
 	data[i*N+j] = __hmul2(data[i*N+j], __float2half2_rn(a));
 }
 
-// it seems you can't have too many plans simultaneously.
-// workaround: conditionals in the callback?
-// ... I tried this. much slower. thought branching was killing performance
-// which doesn't make sense, all threads take same path
-// it wasn't, which is good, sort of... turns out the *struct* was the issue
-
-// this will have an out-of-bounds error... unless you allocate an extra element
 __device__
 void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, void *sharedPtr)
 {
@@ -139,15 +133,14 @@ void _mul(void *dataOut, size_t offset, cufftComplex element, void *callerInfo, 
 	a = *(half2 *)&element;
 	b = ((half2 *)callerInfo)[offset];
 
-	// don't use intrinsics here, this is fastest
 //	c.x = a.x * b.x - a.y * b.y;
 //	c.y = a.x * b.y + a.y * b.x;
 
 	half2 temp = __hmul2(a, b);
-	half c_x = __hadd(((half *)&temp)[0], __hneg(((half *)&temp)[1]));
+	half c_x = __hadd(__low2half(temp), __high2half(temp));
 
 	temp = __hmul2(a, __lowhigh2highlow(b));
-	half c_y = __hadd(((half *)&temp)[0], ((half *)&temp)[1]);
+	half c_y = __hadd(__low2half(temp), __high2half(temp));
 
 	((half2 *)dataOut)[offset] = __halves2half2(c_x, c_y);
 }
@@ -204,33 +197,40 @@ void half2_to_complex(half2 *h, cufftComplex *z)
 	z[i*N+j] = __half22float2(h[i*N+j]);
 }
 
+// this is a massive bottleneck.
 __global__
 void multiply_filter(half2 *z, const __restrict__ half2 *w)
 {
-	int i = blockIdx.x;
-	int j = threadIdx.x; // blockDim shall equal N
+	const int i = blockIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
 
-	half2 a, b;
+	const half2 b = w[i*N+j];
+	const half2 b_inv = __lowhigh2highlow(b);
 
-	a = z[i*N+j];
-	b = w[i*N+j];
+	for (int k = 0; k < NUM_SLICES; k++)
+	{
+		half2 a = z[i*N+j];
 
-	half2 temp = __hmul2(a, b);
-	half c_x = __hsub(__low2half(temp), __high2half(temp));
+		half2 temp = __hmul2(a, b);
+		half c_x = __hsub(__low2half(temp), __high2half(temp));
 
-	temp = __hmul2(a, __lowhigh2highlow(b));
-	half c_y = __hadd(__low2half(temp), __high2half(temp));
+		temp = __hmul2(a, b_inv);
+		half c_y = __hadd(__low2half(temp), __high2half(temp));
 
-	z[i*N+j] = __halves2half2(c_x, c_y);
+		z[i*N+j] = __halves2half2(c_x, c_y);
+
+		z += N*N;
+
+		// __syncthreads(); // coalesce?
+	}
 }
 
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 1;
-	int num_slices = 30; // 100
-	float z_min = 50; // 30;
+	int num_frames = 3;
+	float z_min = 30;
 	float z_step = 1;
 
 	cudaStream_t math_stream, copy_stream;
@@ -238,7 +238,7 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
 	// the multiply callback was throwing invalid type error...
-	cufftHandle plan;
+	cufftHandle plan, plan_batch;
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
 	checkCudaErrors( cufftCreate(&plan) );
@@ -247,21 +247,38 @@ int main(int argc, char* argv[])
 			NULL, 1, 0, CUDA_C_16F, \
 			1, &work_sizes, CUDA_C_16F) );
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
+	checkCudaErrors( cufftCreate(&plan_batch) );
+	checkCudaErrors( cufftXtMakePlanMany(plan_batch, 2, dims, \
+			NULL, 1, 0, CUDA_C_16F, \
+			NULL, 1, 0, CUDA_C_16F, \
+			NUM_SLICES, &work_sizes, CUDA_C_16F) );
+	checkCudaErrors( cufftSetStream(plan_batch, math_stream) );
 
-	half2 *d_img, *d_psf;
-	checkCudaErrors( cudaMalloc((void **)&d_psf, N*N*sizeof(half2)) );
+	half2 *d_img, *d_psf, *d_cube;
+	checkCudaErrors( cudaMalloc((void **)&d_psf, NUM_SLICES*N*N*sizeof(half2)) );
 	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(half2)) );
+	checkCudaErrors( cudaMalloc((void **)&d_cube, NUM_SLICES*N*N*sizeof(half2)) );
 
 	byte *d_img_u8;
 	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(byte)) );
 
-	// full-size is necessary for downstream reduction, need the whole cube
-	half *d_slices;
-	checkCudaErrors( cudaMalloc((void **)&d_slices, num_slices*N*N*sizeof(half)) );
-
 	// wouldn't exist in streaming application
-	half_float::half *h_slices;
-	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(half)) );
+	half_float::half *h_cube;
+	checkCudaErrors( cudaMallocHost((void **)&h_cube, NUM_SLICES*N*N*sizeof(half)) );
+
+	// TODO: do image FFT and serialized PSF FFT in float32
+
+	// I don't mind caching the whole thing now that it's in half-precision
+	// present implementation generates it in float and stores as half - this is desired
+	// generate the PSF, weakly taking advantage of symmetry to speed up
+	for (int slice = 0; slice < NUM_SLICES; slice++)
+	{
+		float z = z_min + z_step * slice;
+		construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf + slice*N*N, -2.f * z / LAMBDA0 / N);
+	}
+
+	// FFT the PSF
+	checkCudaErrors( cufftXtExec(plan_batch, d_psf, d_psf, CUFFT_FORWARD) );
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
@@ -270,47 +287,42 @@ int main(int argc, char* argv[])
 
 		checkCudaErrors( cudaMemcpy(d_img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
 
-		byte_to_complex<<<N, N>>>(d_img_u8, d_img);
+		byte_to_complex<<<N, N, 0, math_stream>>>(d_img_u8, d_img);
 
-		normalize_by<<<N, N>>>(d_img, N);
+		normalize_by<<<N, N, 0, math_stream>>>(d_img, N);
 
 		checkCudaErrors( cufftXtExec(plan, d_img, d_img, CUFFT_FORWARD) );
-		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing a plan
 
-		normalize_by<<<N, N>>>(d_img, N);
+		normalize_by<<<N, N, 0, math_stream>>>(d_img, N);
 
 		// TODO: do the image FFT in 32-bit, then cast to 16-bit
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N>>>(d_img);
 
-		for (int slice = 0; slice < num_slices; slice++)
+		// load up the cached PSFs
+		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
+		// TODO: double-buffering
+		checkCudaErrors( cudaMemcpyAsync(d_cube, d_psf, NUM_SLICES*N*N*sizeof(half2), cudaMemcpyDeviceToDevice, math_stream) );
+		// TODO: queue up next frame's copy while this runs
+
+		// multiply by latest frame
+		multiply_filter<<<N, N, 0, math_stream>>>(d_cube, d_img); // callbacks don't work, batch seems next best thing
+
+		// inverse FFT that product
+		checkCudaErrors( cufftXtExec(plan_batch, d_cube, d_cube, CUFFT_INVERSE) );
+
+		// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
+
+		// complex modulus - this is faster than for-loop inside kernel
+		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			float z = z_min + z_step * slice;
-
-			// generate the PSF, weakly taking advantage of symmetry to speed up
-			// pass in 1/normalization now using halfs
-			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0 / N); // speedup with shared memory?
-
-			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
-			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! ~40%
-
-			multiply_filter<<<N, N, 0, math_stream>>>(d_psf, d_img); // hold off FP16 callback until FFT working
-
-			// inverse FFT that product
-			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_INVERSE) );
-
-			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
-
-			// callback doesn't help here either
-			complex_modulus<<<N, N, 0, math_stream>>>(d_psf, d_slices + N*N*slice); // no need to sync streams, full-size buffer
-
-			// it's actually faster to async each slice, surprisingly
-			// could use just a single image for buffer, stream sync was negligible last I checked
-			cudaStreamSynchronize(math_stream);
-			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(half), \
-				cudaMemcpyDeviceToHost, copy_stream) );
+			complex_modulus<<<N, N, 0, math_stream>>>(d_cube + N*N*slice, (half *)d_cube + N*N*slice);
 		}
+
+		checkCudaErrors( cudaStreamSynchronize(math_stream) );
+		checkCudaErrors( cudaMemcpyAsync(h_cube, d_cube, NUM_SLICES*N*N*sizeof(half), \
+			cudaMemcpyDeviceToHost, copy_stream) );
 
 		if (frame == 0)
 			cudaTimerStart();
@@ -318,29 +330,29 @@ int main(int argc, char* argv[])
 
 	checkCudaErrors( cudaDeviceSynchronize() );
 
-	std::cout << cudaTimerStop() << "ms" << std::endl;
+	std::cout << cudaTimerStop() / (num_frames-1) << "ms" << std::endl;
 
 	if (argc == 2)
 	{
-		for (int slice = 0; slice < num_slices; slice++)
+		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
 			cv::Mat B(N, N, CV_32FC1);
-			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((h_slices + N*N*slice)[i]); }
+			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((h_cube + N*N*slice)[i]); }
 			imshow(B);
 		}
 	}
 
-	checkCudaErrors( cudaFree(d_img) );
-	checkCudaErrors( cudaFree(d_img_u8) );
-	checkCudaErrors( cudaFree(d_psf) );
-	checkCudaErrors( cudaFree(d_slices) );
-	checkCudaErrors( cudaFreeHost(h_slices) );
-
-	checkCudaErrors( cufftDestroy(plan) );
-//	checkCudaErrors( cufftDestroy(plan_mul) );
-
-	checkCudaErrors( cudaStreamDestroy(math_stream) );
-	checkCudaErrors( cudaStreamDestroy(copy_stream) );
+//	checkCudaErrors( cudaFree(d_img) );
+//	checkCudaErrors( cudaFree(d_img_u8) );
+//	checkCudaErrors( cudaFree(d_psf) );
+//	checkCudaErrors( cudaFree(d_slices) );
+//	checkCudaErrors( cudaFreeHost(h_slices) );
+//
+//	checkCudaErrors( cufftDestroy(plan) );
+////	checkCudaErrors( cufftDestroy(plan_mul) );
+//
+//	checkCudaErrors( cudaStreamDestroy(math_stream) );
+//	checkCudaErrors( cudaStreamDestroy(copy_stream) );
 
 	return 0;
 }
