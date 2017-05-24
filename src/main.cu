@@ -277,6 +277,8 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cufftXtExec(plan, d_img, d_img, CUFFT_FORWARD) );
 		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing a plan
 
+		normalize_by<<<N, N>>>(d_img, N);
+
 		// TODO: do the image FFT in 32-bit, then cast to 16-bit
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
@@ -288,7 +290,7 @@ int main(int argc, char* argv[])
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
 			// pass in 1/normalization now using halfs
-			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0 / (N*N)); // speedup with shared memory?
+			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0 / N); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! ~40%
