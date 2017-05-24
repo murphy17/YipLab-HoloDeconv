@@ -205,7 +205,7 @@ void half2_to_complex(half2 *h, cufftComplex *z)
 }
 
 __global__
-void multiply_filter(half2 *z, half2 *w)
+void multiply_filter(half2 *z, const __restrict__ half2 *w)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
@@ -216,10 +216,10 @@ void multiply_filter(half2 *z, half2 *w)
 	b = w[i*N+j];
 
 	half2 temp = __hmul2(a, b);
-	half c_x = __hadd(__high2half(temp), __low2half(temp));
+	half c_x = __hsub(__low2half(temp), __high2half(temp));
 
 	temp = __hmul2(a, __lowhigh2highlow(b));
-	half c_y = __hadd(__high2half(temp), __low2half(temp));
+	half c_y = __hadd(__low2half(temp), __high2half(temp));
 
 	z[i*N+j] = __halves2half2(c_x, c_y);
 }
