@@ -9,8 +9,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-//#include <opencv2/gpu/gpu.hpp>
-#include <opencv2/core/cuda.hpp>
+#include <opencv2/gpu/gpu.hpp>
+//#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -39,7 +39,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::cuda::GpuMat in)
+void imshow(cv::gpu::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -178,7 +178,7 @@ int main(int argc, char* argv[])
 			af::ifft2InPlace(A);
 //			af::eval(A);
 //			af::sync();
-//			imshow(cv::cuda::GpuMat(N, N, CV_32FC2, (cufftComplex *)A.device<af::cfloat>()));
+//			imshow(cv::gpu::GpuMat(N, N, CV_32FC2, (cufftComplex *)A.device<af::cfloat>()));
 //			A.unlock();
 			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 			A_mod(af::span, af::span, slice) = af::abs(A);
