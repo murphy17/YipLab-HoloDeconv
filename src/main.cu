@@ -289,10 +289,10 @@ int main(int argc, char* argv[])
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
 			// pass in 1/normalization now using halfs
-			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
+			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0 / N); // speedup with shared memory?
 
-			// the PSF is normalized to +/-1 already, shouldn't need to scale?
-			normalize_by<<<N, N>>>(d_psf, N);
+			// normalization is absolutely necessary. done in above
+//			normalize_by<<<N, N>>>(d_psf, N);
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! ~40%
