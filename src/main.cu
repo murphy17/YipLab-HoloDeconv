@@ -98,24 +98,11 @@ void construct_psf(float z, cufftComplex *g, float norm)
 	g_ij.x = __fdividef(-im, r); // im, r);
 	g_ij.y = __fdividef(re, r);
 
-	// I'm really skeptical about the memory access here
-	// but when I tried shared memory it was slower
+	// CUDA coalescing can deal with the reversed indices, this is fine
 	g[i*N+j] = g_ij;
 	g[i*N+jj] = g_ij;
 	g[ii*N+j] = g_ij;
 	g[ii*N+jj] = g_ij;
-
-	// this is slower!?!?!?!?!
-	// write the half-row
-//	__shared__ cuComplex g_r[N/2];
-//	g[i*N+j] = g_ij;
-//	g[((N - 1) - i)*N+j] = g_ij;
-//	// flip the half-row
-//	g_r[(N/2 - 1) - j] = g_ij; // bank conflicts? can't avoid I think
-//	__syncthreads(); // needed?
-//	// write the flipped half-row
-//	g[i*N+j+N/2] = g_r[j];
-//	g[((N - 1) - i)*N+j+N/2] = g_r[j];
 }
 
 // exploit Fourier duality to shift without copying
@@ -175,6 +162,32 @@ void complex_modulus(cufftComplex *z, float *r)
 	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
 }
 
+__global__
+void batch_multiply(cufftComplex *z, cufftComplex *w)
+{
+	// can have as many threads as you want accessing a single element in cache
+	// so index into the cache with blocks
+	// I'm assuming the shared accesses are pipelined?
+
+	// for now rows easy to work with
+	__shared__ cufftComplex cache[N];
+
+	for (int row = 0; row < N; row++)
+	{
+		// load a row into shared cache
+		cache[blockIdx.x] = w[row*N + blockIdx.x];
+		// scan the row down the cube
+		for (int slice = 0; slice < N; slice++)
+		{
+			cufftComplex a = z[slice*N*N + row*N + threadIdx.x];
+			cufftComplex b = cache[blockIdx.x];
+			z[slice*N*N + row*N + threadIdx.x].x = a.x * b.x - a.y * b.y;
+			z[slice*N*N + row*N + threadIdx.x].y = a.x * b.y + a.y * b.x;
+		}
+		__syncthreads(); // in present configuration they don't overlap; but might help coalescing?
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
@@ -188,30 +201,18 @@ int main(int argc, char *argv[])
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
-	// the batch causes messed up writes, or data conflicts... ?!?!
-	cufftHandle plan, plan_mul;
-	int batch_size = 4;
+	cufftHandle plan;
 	int dims[] = {N, N};
 	checkCudaErrors( cufftPlanMany(&plan, 2, dims, \
 			NULL, 1, 0, \
 			NULL, 1, 0, \
-			CUFFT_C2C, batch_size) );
-	checkCudaErrors( cufftPlanMany(&plan_mul, 2, dims, \
-			NULL, 1, 0, \
-			NULL, 1, 0, \
-			CUFFT_C2C, batch_size) );
+			CUFFT_C2C, num_slices) );
 
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
-	checkCudaErrors( cufftSetStream(plan_mul, math_stream) );
 
 	cufftComplex *d_img, *d_psf;
 	checkCudaErrors( cudaMalloc((void **)&d_psf, batch_size*N*N*sizeof(cufftComplex)) );
 	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(cufftComplex)) );
-
-	// swapping callbacks on the fly is possible, but it adds ~10ms to runtime
-	cufftCallbackStoreC h_mul;
-	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
-	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
 
 	byte *d_img_u8;
 	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(byte)) );
@@ -223,13 +224,6 @@ int main(int argc, char *argv[])
 	// wouldn't exist in streaming application
 	float *h_slices;
 	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(float)) );
-
-//	byte *h_query, *d_query;
-//	checkCudaErrors( cudaMalloc((void **)&d_query, num_slices*sizeof(byte)));
-//	checkCudaErrors( cudaMallocHost((void **)&h_query, num_slices*sizeof(byte)));
-
-	// initially query all slices
-//	memset(h_query, 0, num_slices*sizeof(byte));
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
@@ -248,45 +242,37 @@ int main(int argc, char *argv[])
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N>>>(d_img);
 
-		for (int slice = 0; slice < num_slices; slice += batch_size)
+		// can pipeline now!
+
+		// might as well just cache the PSF if you're gonna do this...
+		for (int slice = 0; slice < num_slices; slice ++)
 		{
-			// skip the slice if we don't expect anything interesting
-//			if (!h_query[slice])
-//				continue;
-
-			for (int i = 0; i < batch_size; i++)
-			{
-				float z = z_min + z_step * (slice + i);
-
-				// generate the PSF, weakly taking advantage of symmetry to speed up
-				construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf + i*N*N, -2.f * z / LAMBDA0);
-			}
-
-			// - callback doesn't work - applies same kernel to all slices
-			// - and output is corrupted...
-
-			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
-			// the utilisation is really bad here too, like 33%... why?
-			checkCudaErrors( cufftExecC2C(plan_mul, d_psf, d_psf, CUFFT_FORWARD) );
-
-			// inverse FFT
-			checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) );
-
-			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
-
-			// callback doesn't help here either
-			for (int i = 0; i < batch_size; i++)
-			{
-				complex_modulus<<<N, N, 0, math_stream>>>(d_psf + i*N*N, d_slices + N*N*(slice+i));
-			}
-
-			// ... this wouldn't happen in the actual workflow
-			// it's actually faster to async each slice, surprisingly
-			// could use just a single image for buffer, stream sync was negligible last I checked
-			cudaStreamSynchronize(math_stream);
-			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, \
-					batch_size*N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
+			float z = z_min + z_step * slice;
+			// generate the PSF, weakly taking advantage of symmetry to speed up
+			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf + slice*N*N, -2.f * z / LAMBDA0);
 		}
+
+		// FFT
+		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_FORWARD) );
+
+		// multiply using shared memory
+		batch_multiply<<<N, N, 0, math_stream>>>(d_psf, d_img);
+
+		// inverse FFT
+		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) );
+
+		// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
+
+		// callback doesn't help here either
+		cudaStreamSynchronize(copy_stream);
+		for (int slice = 0; slice < num_slices; slice++)
+		{
+			complex_modulus<<<N, N, 0, math_stream>>>(d_psf + slice*N*N, d_slices + N*N*(slice+i));
+		}
+
+		cudaStreamSynchronize(math_stream);
+		checkCudaErrors( cudaMemcpyAsync(h_slices, d_slices, num_slices*N*N*sizeof(float), \
+				cudaMemcpyDeviceToHost, copy_stream) );
 
 		checkCudaErrors( cudaDeviceSynchronize() );
 
