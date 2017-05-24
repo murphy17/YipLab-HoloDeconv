@@ -20,8 +20,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-#include <opencv2/core/cuda.hpp>
-//#include <opencv2/gpu/gpu.hpp>
+//#include <opencv2/core/cuda.hpp>
+#include <opencv2/gpu/gpu.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -50,7 +50,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::cuda::GpuMat in)
+void imshow(cv::gpu::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -121,7 +121,7 @@ void frequency_shift(half2 *data)
 
 	float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
 
-	data[i*N+j] = __hmul2(data[i*N+j], __float2half2_rn(a));
+	data[i*N+j] = __hmul2_sat(data[i*N+j], __float2half2_rn(a));
 }
 
 // it seems you can't have too many plans simultaneously.
@@ -228,9 +228,9 @@ int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 5;
-	int num_slices = 100;
-	float z_min = 30;
+	int num_frames = 1;
+	int num_slices = 30; // 100
+	float z_min = 50; // 30;
 	float z_step = 1;
 
 	cudaStream_t math_stream, copy_stream;
