@@ -17,7 +17,7 @@
 				</extensions>
 			</storageModule>
 			<storageModule moduleId="cdtBuildSystem" version="4.0.0">
-				<configuration artifactName="${ProjName}" buildArtefactType="org.eclipse.cdt.build.core.buildArtefactType.exe" buildProperties="org.eclipse.cdt.build.core.buildArtefactType=org.eclipse.cdt.build.core.buildArtefactType.exe,org.eclipse.cdt.build.core.buildType=org.eclipse.cdt.build.core.buildType.debug" cleanCommand="rm -rf" description="" errorParsers="org.eclipse.cdt.core.VCErrorParser;nvcc.errorParser;org.eclipse.cdt.core.GmakeErrorParser;org.eclipse.cdt.core.GCCErrorParser;org.eclipse.cdt.core.GASErrorParser;org.eclipse.cdt.core.GLDErrorParser" id="com.nvidia.cuda.ide.eight_zero.configuration.debug.373183456" name="Debug" parent="com.nvidia.cuda.ide.eight_zero.configuration.debug" postannouncebuildStep="" postbuildStep="" preannouncebuildStep="" prebuildStep="">
+				<configuration artifactName="${ProjName}" buildArtefactType="org.eclipse.cdt.build.core.buildArtefactType.exe" buildProperties="org.eclipse.cdt.build.core.buildType=org.eclipse.cdt.build.core.buildType.debug,org.eclipse.cdt.build.core.buildArtefactType=org.eclipse.cdt.build.core.buildArtefactType.exe" cleanCommand="rm -rf" description="" errorParsers="org.eclipse.cdt.core.VCErrorParser;nvcc.errorParser;org.eclipse.cdt.core.GmakeErrorParser;org.eclipse.cdt.core.GCCErrorParser;org.eclipse.cdt.core.GASErrorParser;org.eclipse.cdt.core.GLDErrorParser" id="com.nvidia.cuda.ide.eight_zero.configuration.debug.373183456" name="Debug" parent="com.nvidia.cuda.ide.eight_zero.configuration.debug" postannouncebuildStep="" postbuildStep="" preannouncebuildStep="" prebuildStep="">
 					<folderInfo id="com.nvidia.cuda.ide.eight_zero.configuration.debug.373183456." name="/" resourcePath="">
 						<toolChain errorParsers="" id="com.nvidia.cuda.tools.toolchain.eight_zero.exe.debug.842471862" name="CUDA Toolkit 8.0" superClass="com.nvidia.cuda.tools.toolchain.eight_zero.exe.debug">
 							<targetPlatform archList="all" binaryParser="com.nvidia.cuda.ide.elf;com.nvidia.cuda.ide.macho;com.nvidia.cuda.ide.cubin" id="com.nvidia.cuda.ide.targetPlatform.1387644008" isAbstract="false" name="Debug Platform" osList="linux,macosx" superClass="com.nvidia.cuda.ide.targetPlatform"/>
@@ -34,6 +34,7 @@
 								<option id="nvcc.compiler.cpp11option.455419389" name="Enable C++11 support (-std=c++11)" superClass="nvcc.compiler.cpp11option" value="true" valueType="boolean"/>
 								<option id="nvcc.compiler.usefastmath.516495862" name="Make use of fast math library (-use_fast_math)" superClass="nvcc.compiler.usefastmath" value="true" valueType="boolean"/>
 								<option id="nvcc.compiler.option.lineinfo.1456876838" name="Generate line-number information for device code (-lineinfo)" superClass="nvcc.compiler.option.lineinfo" value="true" valueType="boolean"/>
+								<option id="nvcc.compiler.maxregcount.1241307973" name="Maximum number of registers (-maxrregcount)" superClass="nvcc.compiler.maxregcount" value="" valueType="string"/>
 								<inputType id="nvcc.compiler.input.cu.245120728" superClass="nvcc.compiler.input.cu"/>
 								<inputType id="nvcc.compiler.input.cpp.1961910211" superClass="nvcc.compiler.input.cpp"/>
 								<inputType id="nvcc.compiler.input.c.448671280" superClass="nvcc.compiler.input.c"/>
@@ -65,10 +66,10 @@
 			</storageModule>
 			<storageModule moduleId="com.nvidia.cuda.ide.build.project.ICudaProjectConfiguration">
 				<executable devicelink="true">
-					<ptx major="5" minor="3"/>
-					<sass major="5" minor="3"/>
+					<ptx major="5" minor="0"/>
+					<sass major="5" minor="0"/>
 				</executable>
-				<editor-arch major="5" minor="3"/>
+				<editor-arch major="5" minor="0"/>
 			</storageModule>
 			<storageModule moduleId="org.eclipse.cdt.core.externalSettings"/>
 		</cconfiguration>
@@ -88,7 +89,7 @@
 				</extensions>
 			</storageModule>
 			<storageModule moduleId="cdtBuildSystem" version="4.0.0">
-				<configuration artifactName="${ProjName}" buildArtefactType="org.eclipse.cdt.build.core.buildArtefactType.exe" buildProperties="org.eclipse.cdt.build.core.buildArtefactType=org.eclipse.cdt.build.core.buildArtefactType.exe,org.eclipse.cdt.build.core.buildType=org.eclipse.cdt.build.core.buildType.release" cleanCommand="rm -rf" description="" id="com.nvidia.cuda.ide.eight_zero.configuration.release.2142737946" name="Release" parent="com.nvidia.cuda.ide.eight_zero.configuration.release">
+				<configuration artifactName="${ProjName}" buildArtefactType="org.eclipse.cdt.build.core.buildArtefactType.exe" buildProperties="org.eclipse.cdt.build.core.buildType=org.eclipse.cdt.build.core.buildType.release,org.eclipse.cdt.build.core.buildArtefactType=org.eclipse.cdt.build.core.buildArtefactType.exe" cleanCommand="rm -rf" description="" id="com.nvidia.cuda.ide.eight_zero.configuration.release.2142737946" name="Release" parent="com.nvidia.cuda.ide.eight_zero.configuration.release">
 					<folderInfo id="com.nvidia.cuda.ide.eight_zero.configuration.release.2142737946." name="/" resourcePath="">
 						<toolChain id="com.nvidia.cuda.ide.toolchain.eight_zero.exe.release.1329405174" name="CUDA Toolkit 8.0" superClass="com.nvidia.cuda.ide.toolchain.eight_zero.exe.release">
 							<targetPlatform archList="all" binaryParser="com.nvidia.cuda.ide.elf;com.nvidia.cuda.ide.macho;com.nvidia.cuda.ide.cubin" id="com.nvidia.cuda.ide.targetPlatform.1619407089" isAbstract="false" name="Debug Platform" osList="linux,macosx" superClass="com.nvidia.cuda.ide.targetPlatform"/>

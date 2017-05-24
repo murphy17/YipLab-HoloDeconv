@@ -223,19 +223,11 @@ int main(int argc, char* argv[])
 	float *h_slices;
 	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(float)) );
 
-	byte *h_query, *d_query;
-	checkCudaErrors( cudaMalloc((void **)&d_query, num_slices*sizeof(byte)));
-	checkCudaErrors( cudaMallocHost((void **)&h_query, num_slices*sizeof(byte)));
-
 	// initially query all slices
-	memset(h_query, 0, num_slices*sizeof(byte));
-
 	for (int frame = 0; frame < num_frames; frame++)
 	{
 		// this would be a copy from a frame buffer on the Tegra
 		cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
-
-		cudaTimerStart();
 
 		checkCudaErrors( cudaMemcpy(d_img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
 
@@ -249,10 +241,6 @@ int main(int argc, char* argv[])
 
 		for (int slice = 0; slice < num_slices; slice++)
 		{
-			// skip the slice if we don't expect anything interesting
-			if (!h_query[slice])
-				continue;
-
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
@@ -267,34 +255,22 @@ int main(int argc, char* argv[])
 			// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 
 			// callback doesn't help here either
+			checkCudaErrors( cudaStreamSynchronize(copy_stream) );
 			complex_modulus<<<N, N, 0, math_stream>>>(d_psf, d_slices + N*N*slice); // no need to sync streams, full-size buffer
 
 			// it's actually faster to async each slice, surprisingly
 			// could use just a single image for buffer, stream sync was negligible last I checked
-			cudaStreamSynchronize(math_stream);
+			checkCudaErrors( cudaStreamSynchronize(math_stream) );
 			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
 		}
 
-		checkCudaErrors( cudaDeviceSynchronize() );
-
-		std::cout << cudaTimerStop() << "ms" << std::endl;
-
-		// now do some reduction to the whole cube...
-		// ...
-
-		// which returns which slices contained objects of interest
-		checkCudaErrors( cudaMemset(d_query, 1, num_slices) ); // for demo purpose, all of them
-		checkCudaErrors( cudaMemcpy(h_query, d_query, num_slices*sizeof(byte), cudaMemcpyDeviceToHost) );
-
-		// for the next frame, query the neighborhoods about each of those
-		// ...
-
-		// ! this is an implicit assumption about the z-velocity of the objects in the sample
-		// picking neighborhood via Kalman filtering would be very cool, but probably overkill
-		// every few frames, just query everything?
-
-		// looking at utilisation, might be able to halve (!!!) that with batching
+		if (frame == 0)
+			cudaTimerStart();
 	}
+
+	checkCudaErrors( cudaDeviceSynchronize() );
+
+	std::cout << cudaTimerStop() / (num_frames-1) << "ms" << std::endl;
 
 	if (argc == 2)
 	{
