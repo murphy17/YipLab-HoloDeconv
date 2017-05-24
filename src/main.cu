@@ -187,6 +187,15 @@ void complex_modulus(half2 *z, float *r)
 }
 
 __global__
+void normalize_by(half2 *h, float n)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	h[i*N+j] = __hmul2(h[i*N+j], __float2half2_rn(1.f / n));
+}
+
+__global__
 void multiply_filter(half2 *z, half2 *w)
 {
 	int i = blockIdx.x;
@@ -250,17 +259,16 @@ int main(int argc, char* argv[])
 		// this would be a copy from a frame buffer on the Tegra
 		cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
 
-		cudaTimerStart();
-
 		checkCudaErrors( cudaMemcpy(d_img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
 
 		byte_to_complex<<<N, N>>>(d_img_u8, d_img);
 
+		normalize_by<<<N, N>>>(d_img, N);
+
 		checkCudaErrors( cufftXtExec(plan, d_img, d_img, CUFFT_FORWARD) );
 		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing a plan
 
-		// problem with 16-bit FFT - the order of magnitude varies by like 5
-		// can I truncate?
+		// TODO: do the image FFT in 32-bit, then cast to 16-bit
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N>>>(d_img);
@@ -270,7 +278,7 @@ int main(int argc, char* argv[])
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
-			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
+			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0 * N); // speedup with shared memory?
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! ~40%
@@ -291,26 +299,13 @@ int main(int argc, char* argv[])
 			checkCudaErrors( cudaMemcpyAsync(h_slices + N*N*slice, d_slices + N*N*slice, N*N*sizeof(float), cudaMemcpyDeviceToHost, copy_stream) );
 		}
 
-		checkCudaErrors( cudaDeviceSynchronize() );
-
-		std::cout << cudaTimerStop() << "ms" << std::endl;
-
-		// now do some reduction to the whole cube...
-		// ...
-
-		// which returns which slices contained objects of interest
-//		checkCudaErrors( cudaMemset(d_query, 1, num_slices) ); // for demo purpose, all of them
-//		checkCudaErrors( cudaMemcpy(h_query, d_query, num_slices*sizeof(byte), cudaMemcpyDeviceToHost) );
-
-		// for the next frame, query the neighborhoods about each of those
-		// ...
-
-		// ! this is an implicit assumption about the z-velocity of the objects in the sample
-		// picking neighborhood via Kalman filtering would be very cool, but probably overkill
-		// every few frames, just query everything?
-
-		// looking at utilisation, might be able to halve (!!!) that with batching
+		if (frame == 0)
+			cudaTimerStart();
 	}
+
+	checkCudaErrors( cudaDeviceSynchronize() );
+
+	std::cout << cudaTimerStop() << "ms" << std::endl;
 
 	if (argc == 2)
 	{
