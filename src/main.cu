@@ -34,6 +34,7 @@
 #define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
 #define SCALE 0.00097751711f // 1/(N-1)
+#define NUM_SLICES 128
 
 typedef unsigned char byte;
 
@@ -169,22 +170,31 @@ void batch_multiply(cufftComplex *z, cufftComplex *w)
 	// so index into the cache with blocks
 	// I'm assuming the shared accesses are pipelined?
 
-	// for now rows easy to work with
-	__shared__ cufftComplex cache[N];
+	// thread index is slice
 
-	for (int row = 0; row < N; row++)
+	// for now rows easy to work with
+//	__shared__ cufftComplex cache[N];
+//
+//	for (int row = 0; row < N; row++)
+//	{
+//		// load a row into shared cache
+//		cache[blockIdx.x] = w[row*N + blockIdx.x];
+//		// scan the row down the cube
+//		for (int slice = 0; slice < NUM_SLICES; slice++)
+//		{
+//			cufftComplex a = z[slice*N*N + row*N + threadIdx.x];
+//			cufftComplex b = cache[blockIdx.x];
+//			z[threadIdx.x*N*N + row*N + threadIdx.x].x = a.x * b.x - a.y * b.y;
+//			z[threadIdx.x*N*N + row*N + threadIdx.x].y = a.x * b.y + a.y * b.x;
+//		}
+//		__syncthreads(); // in present configuration they don't overlap; but might help coalescing?
+//	}
+	cufftComplex b = w[blockIdx.x*N + threadIdx.x];
+	for (int slice = 0; slice < NUM_SLICES; slice++)
 	{
-		// load a row into shared cache
-		cache[blockIdx.x] = w[row*N + blockIdx.x];
-		// scan the row down the cube
-		for (int slice = 0; slice < N; slice++)
-		{
-			cufftComplex a = z[slice*N*N + row*N + threadIdx.x];
-			cufftComplex b = cache[blockIdx.x];
-			z[slice*N*N + row*N + threadIdx.x].x = a.x * b.x - a.y * b.y;
-			z[slice*N*N + row*N + threadIdx.x].y = a.x * b.y + a.y * b.x;
-		}
-		__syncthreads(); // in present configuration they don't overlap; but might help coalescing?
+		cufftComplex a = z[slice*N*N + blockIdx.x*N + threadIdx.x];
+		z[slice*N*N + blockIdx.x*N + threadIdx.x].x = a.x * b.x - a.y * b.y;
+		z[slice*N*N + blockIdx.x*N + threadIdx.x].y = a.x * b.y + a.y * b.x;
 	}
 }
 
@@ -193,7 +203,6 @@ int main(int argc, char *argv[])
 	checkCudaErrors( cudaDeviceReset() );
 
 	int num_frames = 5;
-	int num_slices = 100;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -206,12 +215,12 @@ int main(int argc, char *argv[])
 	checkCudaErrors( cufftPlanMany(&plan, 2, dims, \
 			NULL, 1, 0, \
 			NULL, 1, 0, \
-			CUFFT_C2C, num_slices) );
+			CUFFT_C2C, 1) );
 
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
 
 	cufftComplex *d_img, *d_psf;
-	checkCudaErrors( cudaMalloc((void **)&d_psf, batch_size*N*N*sizeof(cufftComplex)) );
+	checkCudaErrors( cudaMalloc((void **)&d_psf, NUM_SLICES*N*N*sizeof(cufftComplex)) );
 	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(cufftComplex)) );
 
 	byte *d_img_u8;
@@ -219,11 +228,11 @@ int main(int argc, char *argv[])
 
 	// full-size is necessary for downstream reduction, need the whole cube
 	float *d_slices;
-	checkCudaErrors( cudaMalloc((void **)&d_slices, num_slices*N*N*sizeof(float)) );
+	checkCudaErrors( cudaMalloc((void **)&d_slices, NUM_SLICES*N*N*sizeof(float)) );
 
 	// wouldn't exist in streaming application
 	float *h_slices;
-	checkCudaErrors( cudaMallocHost((void **)&h_slices, num_slices*N*N*sizeof(float)) );
+	checkCudaErrors( cudaMallocHost((void **)&h_slices, NUM_SLICES*N*N*sizeof(float)) );
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
@@ -245,33 +254,41 @@ int main(int argc, char *argv[])
 		// can pipeline now!
 
 		// might as well just cache the PSF if you're gonna do this...
-		for (int slice = 0; slice < num_slices; slice ++)
+		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
 			float z = z_min + z_step * slice;
 			// generate the PSF, weakly taking advantage of symmetry to speed up
 			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf + slice*N*N, -2.f * z / LAMBDA0);
 		}
 
-		// FFT
-		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_FORWARD) );
+		for (int slice = 0; slice < NUM_SLICES; slice++)
+		{
+			// FFT
+			checkCudaErrors( cufftExecC2C(plan, d_psf + slice*N*N, d_psf + slice*N*N, CUFFT_FORWARD) );
+		}
+//		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_FORWARD) );
 
 		// multiply using shared memory
 		batch_multiply<<<N, N, 0, math_stream>>>(d_psf, d_img);
 
-		// inverse FFT
-		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) );
+		for (int slice = 0; slice < NUM_SLICES; slice++)
+		{
+			// inverse FFT
+			checkCudaErrors( cufftExecC2C(plan, d_psf + slice*N*N, d_psf + slice*N*N, CUFFT_INVERSE) );
+		}
+//		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) );
 
 		// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 
 		// callback doesn't help here either
-		cudaStreamSynchronize(copy_stream);
-		for (int slice = 0; slice < num_slices; slice++)
+		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
+		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			complex_modulus<<<N, N, 0, math_stream>>>(d_psf + slice*N*N, d_slices + N*N*(slice+i));
+			complex_modulus<<<N, N, 0, math_stream>>>(d_psf + slice*N*N, d_slices + slice*N*N);
 		}
 
-		cudaStreamSynchronize(math_stream);
-		checkCudaErrors( cudaMemcpyAsync(h_slices, d_slices, num_slices*N*N*sizeof(float), \
+		checkCudaErrors( cudaStreamSynchronize(math_stream) );
+		checkCudaErrors( cudaMemcpyAsync(h_slices, d_slices, NUM_SLICES*N*N*sizeof(float), \
 				cudaMemcpyDeviceToHost, copy_stream) );
 
 		checkCudaErrors( cudaDeviceSynchronize() );
@@ -282,8 +299,8 @@ int main(int argc, char *argv[])
 		// ...
 
 		// which returns which slices contained objects of interest
-//		checkCudaErrors( cudaMemset(d_query, 1, num_slices) ); // for demo purpose, all of them
-//		checkCudaErrors( cudaMemcpy(h_query, d_query, num_slices*sizeof(byte), cudaMemcpyDeviceToHost) );
+//		checkCudaErrors( cudaMemset(d_query, 1, NUM_SLICES) ); // for demo purpose, all of them
+//		checkCudaErrors( cudaMemcpy(h_query, d_query, NUM_SLICES*sizeof(byte), cudaMemcpyDeviceToHost) );
 
 		// for the next frame, query the neighborhoods about each of those
 		// ...
@@ -297,7 +314,7 @@ int main(int argc, char *argv[])
 
 	if (argc == 2)
 	{
-		for (int slice = 0; slice < num_slices; slice++)
+		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
 			cv::Mat B(N, N, CV_32FC1, h_slices + N*N*slice);
 			imshow(B);
@@ -311,7 +328,6 @@ int main(int argc, char *argv[])
 	checkCudaErrors( cudaFreeHost(h_slices) );
 
 	checkCudaErrors( cufftDestroy(plan) );
-	checkCudaErrors( cufftDestroy(plan_mul) );
 
 	checkCudaErrors( cudaStreamDestroy(math_stream) );
 	checkCudaErrors( cudaStreamDestroy(copy_stream) );
