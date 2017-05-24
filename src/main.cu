@@ -243,11 +243,11 @@ int main(int argc, char* argv[])
 
 	// this works! division by N is dumb heuristic though
 	// Parseval's theorem?
-	normalize_by<<<N, N>>>(d_img_f16, N*N);
+	normalize_by<<<N, N>>>(d_img_f16, N);
 
 	checkCudaErrors( cufftXtExec(plan, d_img_f16, d_img_f16, CUFFT_FORWARD) );
 
-//	normalize_by<<<N, N>>>(d_img_f16, N);
+	normalize_by<<<N, N>>>(d_img_f16, N);
 
 	checkCudaErrors( cufftXtExec(plan, d_img_f16, d_img_f16, CUFFT_INVERSE) );
 
