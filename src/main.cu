@@ -20,12 +20,11 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-#include <opencv2/gpu/gpu.hpp>
-//#include <opencv2/core/cuda.hpp>
+//#include <opencv2/gpu/gpu.hpp>
+#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
-#include <cuda_fp16.h>
 
 #include "common.h"
 
@@ -49,7 +48,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::gpu::GpuMat in)
+void imshow(cv::cuda::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -129,23 +128,30 @@ void frequency_shift(cufftComplex *data)
 __device__
 void _mul(void *dataOut, size_t offset, cufftComplex a, void *callerInfo, void *sharedPtr)
 {
-//	__half2 val;
-//	asm("{.reg .f16 low,high;\n"
-//	   "  mov.b32 {low,high}, %1;\n"
-//	   "  mov.b32 %0, {high,low};}\n" : "=r"(val.x) : "r"(lh.x));
-//	return val;
-
-	float a_temp = a.y;
 	float bx = ((cufftComplex *)callerInfo)[offset].x;
 	float by = ((cufftComplex *)callerInfo)[offset].y;
-	float ay_by = __fmul_rn(a_temp, by);
-	float ay_bx = __fmul_rn(a_temp, bx);
-	a_temp = a.x;
-	float cx = __fmaf_rn(a_temp, bx, -ay_by);
-	float cy = __fmaf_rn(a_temp, by, ay_bx);
 
-	((cufftComplex *)dataOut)[offset].x = cx;
-	((cufftComplex *)dataOut)[offset].y = cy;
+	asm(".reg .f32 ay_by;\n" // float ay_by
+		".reg .f32 ay_bx;\n" // float ay_bx
+		" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
+		" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
+		" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
+		" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
+		" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
+		"+f"(by), "+f"(bx) : \
+		"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
+
+//	float a_temp = a.y;
+//	float bx = ((cufftComplex *)callerInfo)[offset].x;
+//	float by = ((cufftComplex *)callerInfo)[offset].y;
+//	float ay_by = __fmul_rn(a_temp, by);
+//	float ay_bx = __fmul_rn(a_temp, bx);
+//	a_temp = a.x;
+//	bx = __fmaf_rn(a_temp, bx, -ay_by);
+//	by = __fmaf_rn(a_temp, by, ay_bx);
+
+	((cufftComplex *)dataOut)[offset].x = bx;
+	((cufftComplex *)dataOut)[offset].y = by;
 }
 __device__
 cufftCallbackStoreC d_mul = _mul;
