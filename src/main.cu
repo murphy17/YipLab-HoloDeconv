@@ -162,24 +162,14 @@ void byte_to_complex(byte *b, half2 *z)
 	z[i*N+j] = __floats2half2_rn(((float)(b[i*N+j])) / 255.f, 0.f);
 }
 
-//__global__
-//void byte_to_half_to_float(byte *b, float *f)
-//{
-//	int i = blockIdx.x;
-//	int j = threadIdx.x; // blockDim shall equal N
-//
-//	half h = __float2half(((float)(b[i*N+j])) / 255.f);
-//	f[i*N+j] = __half2float(h);
-//}
-
 __global__
 void complex_modulus(half2 *z, float *r)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
-	half2 temp = __hmul2(z[i*N+j], z[i*N+j]);
-	r[i*N+j] = __half2float(__hadd(__high2half(temp), __low2half(temp)));
+	half2 temp = __hmul2(z[i*N+j], z[i*N+j]); // this might saturate
+	r[i*N+j] = __half2float(__hadd(__low2half(temp), __high2half(temp)));
 
 	// I'm a bit concerned about how those intrinsics expand
 	// too many instructions seems likely
@@ -193,6 +183,24 @@ void normalize_by(half2 *h, float n)
 	int j = threadIdx.x; // blockDim shall equal N
 
 	h[i*N+j] = __hmul2(h[i*N+j], __float2half2_rn(1.f / n));
+}
+
+__global__
+void complex_to_half2(cufftComplex *z, half2 *h)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	h[i*N+j] = __float22half2_rn(z[i*N+j]);
+}
+
+__global__
+void half2_to_complex(half2 *h, cufftComplex *z)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	z[i*N+j] = __half22float2(h[i*N+j]);
 }
 
 __global__
@@ -268,6 +276,8 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cufftXtExec(plan, d_img, d_img, CUFFT_FORWARD) );
 		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing a plan
 
+		normalize_by<<<N, N>>>(d_img, N);
+
 		// TODO: do the image FFT in 32-bit, then cast to 16-bit
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
@@ -278,10 +288,17 @@ int main(int argc, char* argv[])
 			float z = z_min + z_step * slice;
 
 			// generate the PSF, weakly taking advantage of symmetry to speed up
-			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0 * N); // speedup with shared memory?
+			// pass in 1/normalization now using halfs
+			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf, -2.f * z / LAMBDA0); // speedup with shared memory?
+
+			// the PSF is normalized to +/-1 already, shouldn't need to scale?
+			normalize_by<<<N, N>>>(d_psf, N);
 
 			// FFT and multiply. the multiplication is the primary bottleneck in this workflow
 			checkCudaErrors( cufftXtExec(plan, d_psf, d_psf, CUFFT_FORWARD) ); // big speedup with callback! ~40%
+
+//			complex_modulus<<<N, N>>>(d_psf, d_slices); // no need to sync streams, full-size buffer
+//			imshow(cv::cuda::GpuMat(N, N, CV_32FC1, d_slices));
 
 			multiply_filter<<<N, N, 0, math_stream>>>(d_psf, d_img); // hold off FP16 callback until FFT working
 
