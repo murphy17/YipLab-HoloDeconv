@@ -121,7 +121,7 @@ void frequency_shift(half2 *data)
 
 	float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
 
-	data[i*N+j] = __hmul2_sat(data[i*N+j], __float2half2_rn(a));
+	data[i*N+j] = __hmul2(data[i*N+j], __float2half2_rn(a));
 }
 
 // it seems you can't have too many plans simultaneously.
