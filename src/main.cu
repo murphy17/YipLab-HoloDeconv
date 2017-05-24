@@ -166,29 +166,6 @@ void complex_modulus(cufftComplex *z, float *r)
 __global__
 void batch_multiply(cufftComplex *z, cufftComplex *w)
 {
-	// can have as many threads as you want accessing a single element in cache
-	// so index into the cache with blocks
-	// I'm assuming the shared accesses are pipelined?
-
-	// thread index is slice
-
-	// for now rows easy to work with
-//	__shared__ cufftComplex cache[N];
-//
-//	for (int row = 0; row < N; row++)
-//	{
-//		// load a row into shared cache
-//		cache[blockIdx.x] = w[row*N + blockIdx.x];
-//		// scan the row down the cube
-//		for (int slice = 0; slice < NUM_SLICES; slice++)
-//		{
-//			cufftComplex a = z[slice*N*N + row*N + threadIdx.x];
-//			cufftComplex b = cache[blockIdx.x];
-//			z[threadIdx.x*N*N + row*N + threadIdx.x].x = a.x * b.x - a.y * b.y;
-//			z[threadIdx.x*N*N + row*N + threadIdx.x].y = a.x * b.y + a.y * b.x;
-//		}
-//		__syncthreads(); // in present configuration they don't overlap; but might help coalescing?
-//	}
 	cufftComplex b = w[blockIdx.x*N + threadIdx.x];
 	for (int slice = 0; slice < NUM_SLICES; slice++)
 	{
@@ -202,7 +179,7 @@ int main(int argc, char *argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 5;
+	int num_frames = 10;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -210,18 +187,36 @@ int main(int argc, char *argv[])
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
-	cufftHandle plan;
-	int dims[] = {N, N};
-	checkCudaErrors( cufftPlanMany(&plan, 2, dims, \
-			NULL, 1, 0, \
-			NULL, 1, 0, \
-			CUFFT_C2C, 1) );
+	long long dims[] = {N, N};
+	size_t work_sizes = 0;
+	cufftHandle plan, plan_mul, plan_img;
+	cufftCreate(&plan);
+//	cufftCreate(&plan_mul);
+	cufftCreate(&plan_img);
+	checkCudaErrors( cufftXtMakePlanMany(plan, 2, dims, \
+			NULL, 1, 0, CUDA_C_32F, \
+			NULL, 1, 0, CUDA_C_32F, \
+			NUM_SLICES, &work_sizes, CUDA_C_32F) );
+//	checkCudaErrors( cufftXtMakePlanMany(plan_mul, 2, dims, \
+//			NULL, 1, 0, CUDA_C_32F, \
+//			NULL, 1, 0, CUDA_C_32F, \
+//			NUM_SLICES, &work_sizes, CUDA_C_32F) );
+	checkCudaErrors( cufftXtMakePlanMany(plan_img, 2, dims, \
+			NULL, 1, 0, CUDA_C_32F, \
+			NULL, 1, 0, CUDA_C_32F, \
+			1, &work_sizes, CUDA_C_32F) );
 
 	checkCudaErrors( cufftSetStream(plan, math_stream) );
+//	checkCudaErrors( cufftSetStream(plan_mul, math_stream) );
+	checkCudaErrors( cufftSetStream(plan_img, math_stream) );
 
 	cufftComplex *d_img, *d_psf;
 	checkCudaErrors( cudaMalloc((void **)&d_psf, NUM_SLICES*N*N*sizeof(cufftComplex)) );
 	checkCudaErrors( cudaMalloc((void **)&d_img, N*N*sizeof(cufftComplex)) );
+
+//	cufftCallbackStoreC h_mul;
+//	checkCudaErrors( cudaMemcpyFromSymbol(&h_mul, d_mul, sizeof(cufftCallbackStoreC)) );
+//	checkCudaErrors( cufftXtSetCallback(plan_mul, (void **)&h_mul, CUFFT_CB_ST_COMPLEX, (void **)&d_img) );
 
 	byte *d_img_u8;
 	checkCudaErrors( cudaMalloc((void **)&d_img_u8, N*N*sizeof(byte)) );
@@ -239,17 +234,15 @@ int main(int argc, char *argv[])
 		// this would be a copy from a frame buffer on the Tegra
 		cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
 
-		cudaTimerStart();
+		checkCudaErrors( cudaMemcpyAsync(d_img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, math_stream) );
 
-		checkCudaErrors( cudaMemcpy(d_img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
+		byte_to_complex<<<N, N, 0, math_stream>>>(d_img_u8, d_img);
 
-		byte_to_complex<<<N, N>>>(d_img_u8, d_img);
-
-		checkCudaErrors( cufftExecC2C(plan, d_img, d_img, CUFFT_FORWARD) );
-		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing an async plan
+		checkCudaErrors( cufftExecC2C(plan_img, d_img, d_img, CUFFT_FORWARD) );
+//		checkCudaErrors( cudaStreamSynchronize(math_stream) ); // reusing an async plan
 
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
-		frequency_shift<<<N, N>>>(d_img);
+		frequency_shift<<<N, N, 0, math_stream>>>(d_img);
 
 		// can pipeline now!
 
@@ -261,26 +254,26 @@ int main(int argc, char *argv[])
 			construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf + slice*N*N, -2.f * z / LAMBDA0);
 		}
 
-		for (int slice = 0; slice < NUM_SLICES; slice++)
-		{
-			// FFT
-			checkCudaErrors( cufftExecC2C(plan, d_psf + slice*N*N, d_psf + slice*N*N, CUFFT_FORWARD) );
-		}
-//		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_FORWARD) );
+//		for (int slice = 0; slice < NUM_SLICES; slice++)
+//		{
+//			// FFT
+//			checkCudaErrors( cufftExecC2C(plan, d_psf + slice*N*N, d_psf + slice*N*N, CUFFT_FORWARD) );
+//		}
+		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_FORWARD) );
 
-		// multiply using shared memory
+		// multiply
 		batch_multiply<<<N, N, 0, math_stream>>>(d_psf, d_img);
 
-		for (int slice = 0; slice < NUM_SLICES; slice++)
-		{
-			// inverse FFT
-			checkCudaErrors( cufftExecC2C(plan, d_psf + slice*N*N, d_psf + slice*N*N, CUFFT_INVERSE) );
-		}
-//		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) );
+//		for (int slice = 0; slice < NUM_SLICES; slice++)
+//		{
+//			// inverse FFT
+//			checkCudaErrors( cufftExecC2C(plan, d_psf + slice*N*N, d_psf + slice*N*N, CUFFT_INVERSE) );
+//		}
+		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_INVERSE) );
 
 		// for FFT shift would need to invert phase now, but it doesn't matter since we're taking modulus
 
-		// callback doesn't help here either
+		// for-looping outside this kernel is *much* faster
 		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
@@ -291,26 +284,13 @@ int main(int argc, char *argv[])
 		checkCudaErrors( cudaMemcpyAsync(h_slices, d_slices, NUM_SLICES*N*N*sizeof(float), \
 				cudaMemcpyDeviceToHost, copy_stream) );
 
-		checkCudaErrors( cudaDeviceSynchronize() );
-
-		std::cout << cudaTimerStop() << "ms" << std::endl;
-
-		// now do some reduction to the whole cube...
-		// ...
-
-		// which returns which slices contained objects of interest
-//		checkCudaErrors( cudaMemset(d_query, 1, NUM_SLICES) ); // for demo purpose, all of them
-//		checkCudaErrors( cudaMemcpy(h_query, d_query, NUM_SLICES*sizeof(byte), cudaMemcpyDeviceToHost) );
-
-		// for the next frame, query the neighborhoods about each of those
-		// ...
-
-		// ! this is an implicit assumption about the z-velocity of the objects in the sample
-		// picking neighborhood via Kalman filtering would be very cool, but probably overkill
-		// every few frames, just query everything?
-
-		// looking at utilisation, might be able to halve (!!!) that with batching
+		if (frame == 0)
+			cudaTimerStart();
 	}
+
+	checkCudaErrors( cudaDeviceSynchronize() );
+
+	std::cout << cudaTimerStop() / (num_frames-1) << "ms" << std::endl;
 
 	if (argc == 2)
 	{
@@ -328,6 +308,8 @@ int main(int argc, char *argv[])
 	checkCudaErrors( cudaFreeHost(h_slices) );
 
 	checkCudaErrors( cufftDestroy(plan) );
+//	checkCudaErrors( cufftDestroy(plan_mul) );
+	checkCudaErrors( cufftDestroy(plan_img) );
 
 	checkCudaErrors( cudaStreamDestroy(math_stream) );
 	checkCudaErrors( cudaStreamDestroy(copy_stream) );
