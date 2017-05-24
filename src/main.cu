@@ -197,19 +197,30 @@ void half2_to_complex(half2 *h, cufftComplex *z)
 	z[i*N+j] = __half22float2(h[i*N+j]);
 }
 
-// this is a massive bottleneck.
+__device__ __force_inline__
+half2 __hmulc(half2 a, half2 b)
+{
+	half2 c;
+	// TODO: half2 complex multiply in assembler
+	return c;
+}
+
+// this is a massive bottleneck
+// it's using local memory, bad
 __global__
 void multiply_filter(half2 *z, const __restrict__ half2 *w)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	const half2 b = w[i*N+j];
-	const half2 b_inv = __lowhigh2highlow(b);
+	half2 b = w[i*N+j];
+	half2 b_inv = __lowhigh2highlow(b);
 
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
 		half2 a = z[i*N+j];
+
+		// figure out if c_x, c_y can be packed
 
 		half2 temp = __hmul2(a, b);
 		half c_x = __hsub(__low2half(temp), __high2half(temp));
@@ -301,7 +312,6 @@ int main(int argc, char* argv[])
 		frequency_shift<<<N, N>>>(d_img);
 
 		// load up the cached PSFs
-		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
 		// TODO: double-buffering
 		checkCudaErrors( cudaMemcpyAsync(d_cube, d_psf, NUM_SLICES*N*N*sizeof(half2), cudaMemcpyDeviceToDevice, math_stream) );
 		// TODO: queue up next frame's copy while this runs
@@ -320,9 +330,9 @@ int main(int argc, char* argv[])
 			complex_modulus<<<N, N, 0, math_stream>>>(d_cube + N*N*slice, (half *)d_cube + N*N*slice);
 		}
 
-		checkCudaErrors( cudaStreamSynchronize(math_stream) );
+		// synchronous for now, lazy
 		checkCudaErrors( cudaMemcpyAsync(h_cube, d_cube, NUM_SLICES*N*N*sizeof(half), \
-			cudaMemcpyDeviceToHost, copy_stream) );
+			cudaMemcpyDeviceToHost, math_stream) );
 
 		if (frame == 0)
 			cudaTimerStart();
