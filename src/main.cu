@@ -177,8 +177,9 @@ void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 	// each thread block processes blockDims.x different elements of w
 	__shared__ cufftComplex cache[MAX_BLOCK_THREADS / NUM_SLICES];
 
-	int inIdx = blockIdx.x * (MAX_BLOCK_THREADS / NUM_SLICES) + threadIdx.x;
+	int inIdx = blockIdx.x * blockDim.x + threadIdx.x; // blockDim.x  (MAX_BLOCK_THREADS / NUM_SLICES)
 	int outIdx = threadIdx.y * (N*N) + inIdx;
+//	int outIdx = threadIdx.y + inIdx * NUM_SLICES; // same elements in successive slices adjacent in memory
 
 	if (threadIdx.y == 0)
 	{
