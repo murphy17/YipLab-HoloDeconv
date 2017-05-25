@@ -30,7 +30,7 @@
 #define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
 #define SCALE 0.00097751711f // 1/(N-1)
-#define NUM_SLICES 30 // 100
+#define NUM_SLICES 100 // 100
 #define MAX_BLOCK_THREADS 1024
 
 typedef unsigned char byte;
@@ -335,37 +335,37 @@ int main(int argc, char* argv[])
 
 	// Tegra runs out of memory when I try to visualize 100 slices...
 
-	checkCudaErrors( cudaFree(image) );
-	checkCudaErrors( cudaFree(psf) );
-	checkCudaErrors( cudaFreeHost(host_psf) );
-
-	for (int i = 0; i < num_streams; i++)
-	{
-		checkCudaErrors( cufftDestroy(fft_plans[i]) );
-		checkCudaErrors( cudaStreamDestroy(streams[i]) );
-		// checkCudaErrors( cudaFree(stream_buffers[i]) );
-	}
-
-	checkCudaErrors( cudaFree(stream_buffers[1]) );
-
-	checkCudaErrors( cudaDeviceSynchronize() );
-
-	half_float::half *host_buffer;
-	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
-
-	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
-
-	checkCudaErrors( cudaFree(stream_buffers[0]) );
-
-	if (argc == 2)
-	{
-		for (int slice = 0; slice < NUM_SLICES; slice++)
-		{
-			cv::Mat B(N, N, CV_32FC1);
-			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((host_buffer + N*N*slice)[i]); }
-			imshow(B);
-		}
-	}
+//	checkCudaErrors( cudaFree(image) );
+//	checkCudaErrors( cudaFree(psf) );
+//	checkCudaErrors( cudaFreeHost(host_psf) );
+//
+//	for (int i = 0; i < num_streams; i++)
+//	{
+//		checkCudaErrors( cufftDestroy(fft_plans[i]) );
+//		checkCudaErrors( cudaStreamDestroy(streams[i]) );
+//		// checkCudaErrors( cudaFree(stream_buffers[i]) );
+//	}
+//
+//	checkCudaErrors( cudaFree(stream_buffers[1]) );
+//
+//	checkCudaErrors( cudaDeviceSynchronize() );
+//
+//	half_float::half *host_buffer;
+//	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
+//
+//	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
+//
+//	checkCudaErrors( cudaFree(stream_buffers[0]) );
+//
+//	if (argc == 2)
+//	{
+//		for (int slice = 0; slice < NUM_SLICES; slice++)
+//		{
+//			cv::Mat B(N, N, CV_32FC1);
+//			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((host_buffer + N*N*slice)[i]); }
+//			imshow(B);
+//		}
+//	}
 
 	// TODO: reimplement cleanup code once satisfied with implementation
 

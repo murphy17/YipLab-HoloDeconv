@@ -38,7 +38,7 @@
 								<option id="nvcc.compiler.ptxasoptions.119059216" name="ptaxas options (-Xptxas)" superClass="nvcc.compiler.ptxasoptions" valueType="stringList">
 									<listOptionValue builtIn="false" value="-O3"/>
 								</option>
-								<option id="nvcc.compiler.compileroptions.529489996" superClass="nvcc.compiler.compileroptions" valueType="stringList">
+								<option id="nvcc.compiler.compileroptions.529489996" name="Preprocessor options (-Xcompiler)" superClass="nvcc.compiler.compileroptions" valueType="stringList">
 									<listOptionValue builtIn="false" value="-O3"/>
 								</option>
 								<inputType id="nvcc.compiler.input.cu.245120728" superClass="nvcc.compiler.input.cu"/>
