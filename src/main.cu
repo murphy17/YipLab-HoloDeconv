@@ -120,12 +120,6 @@ void frequency_shift(cufftComplex *data)
 	data[i*N+j].y *= a;
 }
 
-// it seems you can't have too many plans simultaneously.
-// workaround: conditionals in the callback?
-// ... I tried this. much slower. thought branching was killing performance
-// which doesn't make sense, all threads take same path
-// it wasn't, which is good, sort of... turns out the *struct* was the issue
-
 __device__ __forceinline__
 void _mul(void *dataOut, size_t offset, cufftComplex a, void *callerInfo, void *sharedPtr)
 {
@@ -167,6 +161,20 @@ void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
 		cufftComplex a = z[i*N+j];
+
+		// this gives like 3% speedup
+//		asm(".reg .f32 ay_by;\n" // float ay_by
+//			".reg .f32 ay_bx;\n" // float ay_bx
+//			" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
+//			" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
+//			" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
+//			" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
+//			" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
+//			"+f"(by), "+f"(bx) : \
+//			"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
+//		z[i*N+j].x = bx;
+//		z[i*N+j].y = by;
+
 		float a_temp = a.y;
 		float ay_by = __fmul_rn(a_temp, by);
 		float ay_bx = __fmul_rn(a_temp, bx);
