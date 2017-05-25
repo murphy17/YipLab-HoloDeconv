@@ -19,7 +19,9 @@
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
+#include <cuda_fp16.h>
 
+#include "half.hpp"
 #include "common.h"
 
 #define N 1024
@@ -28,7 +30,7 @@
 #define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
 #define SCALE 0.00097751711f // 1/(N-1)
-#define NUM_SLICES 100 // 100
+#define NUM_SLICES 30 // 100
 #define MAX_BLOCK_THREADS 1024
 
 typedef unsigned char byte;
@@ -66,7 +68,7 @@ void imshow(cv::gpu::GpuMat in)
 // exploits 4-fold symmetry (PSF is also radially symmetric, but that's harder...)
 // note that answer is scaled between +/-1
 __global__
-void construct_psf(float z, cufftComplex *g, float norm)
+void construct_psf(float z, half2 *g, float norm)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
@@ -94,64 +96,37 @@ void construct_psf(float z, cufftComplex *g, float norm)
 	g_ij.x = __fdividef(-im, r); // im, r);
 	g_ij.y = __fdividef(re, r);
 
-	// CUDA takes care of coalescing the reversed access, this is fine
-	g[i*N+j] = g_ij;
-	g[i*N+jj] = g_ij;
-	g[ii*N+j] = g_ij;
-	g[ii*N+jj] = g_ij;
+	// cast to half-precision
+	half2 g_ij_fp16 = __floats2half2_rn(g_ij.x, g_ij.y);
+
+	// CUDA takes care of reversed-index coalescing, this is fine
+	g[i*N+j] = g_ij_fp16;
+	g[i*N+jj] = g_ij_fp16;
+	g[ii*N+j] = g_ij_fp16;
+	g[ii*N+jj] = g_ij_fp16;
 }
 
 // exploit Fourier duality to shift without copying
 // credit to http://www.orangeowlsolutions.com/archives/251
 __global__
-void frequency_shift(cufftComplex *data)
+void frequency_shift(half2 *data)
 {
-    const int i = blockIdx.x;
-    const int j = threadIdx.x;
+    int i = blockIdx.x;
+    int j = threadIdx.x;
 
-	const float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
+	float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
 
-	data[i*N+j].x *= a;
-	data[i*N+j].y *= a;
+	data[i*N+j] = __hmul2(data[i*N+j], __float2half2_rn(a));
 }
-
-__device__ __forceinline__
-void _mul(void *dataOut, size_t offset, cufftComplex a, void *callerInfo, void *sharedPtr)
-{
-	float bx = ((cufftComplex *)callerInfo)[offset].x;
-	float by = ((cufftComplex *)callerInfo)[offset].y;
-
-//	asm(".reg .f32 ay_by;\n" // float ay_by
-//		".reg .f32 ay_bx;\n" // float ay_bx
-//		" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
-//		" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
-//		" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
-//		" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
-//		" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
-//		"+f"(by), "+f"(bx) : \
-//		"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
-
-	float a_temp = a.y;
-	float ay_by = __fmul_rn(a_temp, by);
-	float ay_bx = __fmul_rn(a_temp, bx);
-	a_temp = a.x;
-	bx = __fmaf_rn(a_temp, bx, -ay_by);
-	by = __fmaf_rn(a_temp, by, ay_bx);
-
-	((cufftComplex *)dataOut)[offset].x = bx;
-	((cufftComplex *)dataOut)[offset].y = by;
-}
-__device__
-cufftCallbackStoreC d_mul = _mul;
 
 //__global__
-//void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+//void batch_multiply(half2 *z, const __restrict__ half2 *w)
 //{
 //	// threadIdx.x = slice index
 //	// threadIdx.y = element index
 //
 //	// each thread block processes blockDims.x different elements of w
-//	__shared__ cufftComplex cache[MAX_BLOCK_THREADS / NUM_SLICES];
+//	__shared__ half2 cache[MAX_BLOCK_THREADS / NUM_SLICES];
 //
 //	int inIdx = blockIdx.x * blockDim.x + threadIdx.x; // blockDim.x  (MAX_BLOCK_THREADS / NUM_SLICES)
 //	int outIdx = threadIdx.y * (N*N) + inIdx;
@@ -164,7 +139,7 @@ cufftCallbackStoreC d_mul = _mul;
 //	}
 //	__syncthreads();
 //
-//	cufftComplex a = z[outIdx];
+//	half2 a = z[outIdx];
 //	float a_temp = a.y;
 //	float ay_by = __fmul_rn(a_temp, cache[threadIdx.x].y);
 //	float ay_bx = __fmul_rn(a_temp, cache[threadIdx.x].x);
@@ -175,68 +150,64 @@ cufftCallbackStoreC d_mul = _mul;
 //}
 
 __global__
-void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+void batch_multiply(half2 *z, const __restrict__ half2 *w)
 {
 	const int i = blockIdx.x;
-	const int j = threadIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
 
-	cufftComplex b = w[i*N+j];
-	float bx = b.x; float by = b.y; // just making sure
+	half2 b = w[i*N+j];
+	half2 b_inv = __lowhigh2highlow(b);
 
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
-		cufftComplex a = z[i*N+j];
+		half2 a = z[i*N+j];
 
-		// this gives like 3% speedup
-//		asm(".reg .f32 ay_by;\n" // float ay_by
-//			".reg .f32 ay_bx;\n" // float ay_bx
-//			" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
-//			" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
-//			" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
-//			" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
-//			" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
-//			"+f"(by), "+f"(bx) : \
-//			"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
-//		z[i*N+j].x = bx;
-//		z[i*N+j].y = by;
+		// figure out if c_x, c_y can be packed
 
-		float a_temp = a.y;
-		float ay_by = __fmul_rn(a_temp, by);
-		float ay_bx = __fmul_rn(a_temp, bx);
-		a_temp = a.x;
-		z[i*N+j].x = __fmaf_rn(a_temp, bx, -ay_by);
-		z[i*N+j].y = __fmaf_rn(a_temp, by, ay_bx);
+		half2 temp = __hmul2(a, b);
+		half c_x = __hsub(__low2half(temp), __high2half(temp));
+
+		temp = __hmul2(a, b_inv);
+		half c_y = __hadd(__low2half(temp), __high2half(temp));
+
+		z[i*N+j] = __halves2half2(c_x, c_y);
 
 		z += N*N;
+
+		// __syncthreads(); // coalesce?
 	}
 }
 
 __global__
-void byte_to_complex(byte *b, cufftComplex *z)
+void byte_to_half2(const __restrict__ byte *b, half2 *z)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	z[i*N+j].x = ((float)(b[i*N+j])) / 255.f;
-	z[i*N+j].y = 0.f;
+	z[i*N+j] = __floats2half2_rn(((float)(b[i*N+j])) / 255.f, 0.f);
 }
 
 __global__
-void complex_modulus(cufftComplex *z, float *r)
+void modulus_half2(half2 *z, half *r)
 {
-	const int i = blockIdx.x;
-	const int j = threadIdx.x; // blockDim shall equal N
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
 
-	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
+	half2 temp = __hmul2(z[i*N+j], z[i*N+j]); // this might saturate
+	r[i*N+j] = __hadd(__low2half(temp), __high2half(temp));
+
+	// I'm a bit concerned about how those intrinsics expand
+	// too many instructions seems likely
+	// write your own?
 }
 
 __global__
-void copy_buffer(cufftComplex *a, cufftComplex *b)
+void normalize_by(half2 *h, float n)
 {
-	const int i = blockIdx.x;
-	const int j = threadIdx.x; // blockDim shall equal N
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
 
-	b[i*N+j] = a[i*N+j];
+	h[i*N+j] = __hmul2(h[i*N+j], __float2half2_rn(1.f / n));
 }
 
 int main(int argc, char* argv[])
@@ -250,22 +221,22 @@ int main(int argc, char* argv[])
 
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
-	size_t buffer_size = NUM_SLICES*N*N*sizeof(cufftComplex);
+	size_t buffer_size = NUM_SLICES*N*N*sizeof(half2);
 
-	cufftComplex *image;
-	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(cufftComplex)) );
-	cufftComplex *psf;
-	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(cufftComplex)) );
+	half2 *image;
+	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(half2)) );
+	half2 *psf;
+	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(half2)) );
 	// allocate this on the host - that way CPU can manage transfer, not GPU, lets it run in async
 	// (this is 3x slower on Titan, but faster on Tegra - recall that host and GPU memory are the same thing in Tegra)
-	cufftComplex *host_psf;
+	half2 *host_psf;
 	checkCudaErrors( cudaMallocHost((void **)&host_psf, buffer_size) );
 
 	byte *image_u8;
 	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
 
 	cudaStream_t streams[num_streams];
-	cufftComplex *stream_buffers[num_streams];
+	half2 *stream_buffers[num_streams];
 	cufftHandle fft_plans[num_streams];
 
 	// setup multiply kernel
@@ -280,21 +251,21 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cufftCreate(&fft_plans[i]) );
 		checkCudaErrors( cufftXtMakePlanMany( \
 				fft_plans[i], 2, dims, \
-				NULL, 1, 0, CUDA_C_32F, \
-				NULL, 1, 0, CUDA_C_32F, \
-				1, &work_sizes, CUDA_C_32F) );
+				NULL, 1, 0, CUDA_C_16F, \
+				NULL, 1, 0, CUDA_C_16F, \
+				1, &work_sizes, CUDA_C_16F) );
 		checkCudaErrors( cufftSetStream(fft_plans[i], streams[i]) );
 		checkCudaErrors( cudaMalloc((void **)&stream_buffers[i], buffer_size) );
 	}
 
-	// cache the PSF; with a Titan or 8GB TX2 this shouldn't be an issue
-	// note this allows async copying for next frame... (I think? are self-copies DMA?)
+	// cache the PSF host-side
+	// this causes problems for Titan (separate memory), but ~10% speedup for Tegra
 	for (int slice = 0; slice < NUM_SLICES; slice++)
 	{
 		float z = z_min + z_step * slice;
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
-		construct_psf<<<N/2, N/2, 0, streams[0]>>>(z, psf, -2.f * z / LAMBDA0);
+		construct_psf<<<N/2, N/2, 0, streams[0]>>>(z, psf, -2.f * z / LAMBDA0 / N);
 
 		// FFT in-place
 		checkCudaErrors( cufftXtExec(fft_plans[0], psf, psf, CUFFT_FORWARD) );
@@ -303,7 +274,7 @@ int main(int argc, char* argv[])
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N, 0, streams[0]>>>(psf);
 
-		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(cufftComplex), cudaMemcpyDeviceToHost, streams[0]) );
+		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(half2), cudaMemcpyDeviceToHost, streams[0]) );
 	}
 
 	// this would be a copy from a frame buffer on the Tegra
@@ -315,7 +286,7 @@ int main(int argc, char* argv[])
 	{
 		int stream_num = frame % num_streams;
 		cudaStream_t stream = streams[stream_num];
-		cufftComplex *buffer = stream_buffers[stream_num];
+		half2 *buffer = stream_buffers[stream_num];
 
 		// wait for a frame...
 		while (!frameReady) { ; }
@@ -327,10 +298,12 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cudaMemcpyAsync(buffer, host_psf, buffer_size, cudaMemcpyHostToDevice, stream) );
 
 		// up-cast to complex
-		byte_to_complex<<<N, N, 0, stream>>>(image_u8, image);
+		byte_to_half2<<<N, N, 0, stream>>>(image_u8, image);
+		normalize_by<<<N, N, 0, stream>>>(image, N);
 
 		// FFT the image in-place
-		checkCudaErrors( cufftExecC2C(fft_plans[stream_num], image, image, CUFFT_FORWARD) );
+		checkCudaErrors( cufftXtExec(fft_plans[stream_num], image, image, CUFFT_FORWARD) );
+		normalize_by<<<N, N, 0, stream>>>(image, N);
 
 		// batch-multiply with FFT'ed image
 		batch_multiply<<<N, N, 0, stream>>>(buffer, image);
@@ -348,11 +321,8 @@ int main(int argc, char* argv[])
 		// TODO: reusing the first half of the buffer ... is this fine? not sure about that!!!
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			complex_modulus<<<N, N, 0, stream>>>(buffer + N*N*slice, (float *)buffer + N*N*slice);
+			modulus_half2<<<N, N, 0, stream>>>(buffer + N*N*slice, (half *)buffer + N*N*slice);
 		}
-
-		// checkCudaErrors( cudaStreamSynchronize(streams[(frame - 1) % num_streams]) ); // this would not be needed!
-		// checkCudaErrors( cudaMemcpyAsync(host_buffer, buffer, buffer_size, cudaMemcpyDeviceToHost, stream) ); // holy shit this is slow
 
 		// start timer after first run, GPU "warmup"
 		if (frame == 0)
@@ -363,7 +333,7 @@ int main(int argc, char* argv[])
 
 	std::cout << cudaTimerStop() / (num_frames - 1) << "ms" << std::endl;
 
-	// Tegra runs out of memory when I try to visualize...
+	// Tegra runs out of memory when I try to visualize 100 slices...
 
 	checkCudaErrors( cudaFree(image) );
 	checkCudaErrors( cudaFree(psf) );
@@ -380,10 +350,10 @@ int main(int argc, char* argv[])
 
 	checkCudaErrors( cudaDeviceSynchronize() );
 
-	float *host_buffer;
+	half_float::half *host_buffer;
 	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
 
-	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], buffer_size, cudaMemcpyDeviceToHost) );
+	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
 
 	checkCudaErrors( cudaFree(stream_buffers[0]) );
 
@@ -391,7 +361,8 @@ int main(int argc, char* argv[])
 	{
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
+			cv::Mat B(N, N, CV_32FC1);
+			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((host_buffer + N*N*slice)[i]); }
 			imshow(B);
 		}
 	}
