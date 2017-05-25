@@ -188,20 +188,26 @@ void byte_to_half2(const __restrict__ byte *b, half2 *z)
 }
 
 __global__
-void modulus_half2(half2 *z, half *r)
+void batch_modulus(half2 *z, half *r)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x * 2; // blockDim shall equal N/2
 
-	half2 ax_ay = __hmul2(z[i*N+j], z[i*N+j]);
-	half2 bx_by = __hmul2(z[i*N+j+1], z[i*N+j+1]);
+	for (int slice = 0; slice < NUM_SLICES; slice++)
+	{
+		half2 ax_ay = __hmul2(z[i*N+j], z[i*N+j]);
+		half2 bx_by = __hmul2(z[i*N+j+1], z[i*N+j+1]);
 
-	// 'transpose'
-	half2 ax_bx = __highs2half2(ax_ay, bx_by);
-	half2 ay_by = __lows2half2(ax_ay, bx_by);
+		// 'transpose'
+		half2 ax_bx = __highs2half2(ax_ay, bx_by);
+		half2 ay_by = __lows2half2(ax_ay, bx_by);
 
-	// full-byte stores
-	*(half2 *)&r[i*N+j] = h2sqrt(__hadd2(ax_bx, ay_by));
+		// full-byte stores
+		*(half2 *)&r[i*N+j] = h2sqrt(__hadd2(ax_bx, ay_by));
+
+		z += N*N;
+		r += N*N;
+	}
 }
 
 __global__
@@ -244,6 +250,9 @@ int main(int argc, char* argv[])
 	half2 *buffers[2];
 	checkCudaErrors( cudaMalloc((void **)&buffers[0], buffer_size) );
 	checkCudaErrors( cudaMalloc((void **)&buffers[1], buffer_size) );
+
+	half *modulus;
+	checkCudaErrors( cudaMalloc((void **)&modulus, buffer_size / 2) );
 
 	cufftHandle fft_plan;
 	checkCudaErrors( cufftCreate(&fft_plan) );
@@ -313,12 +322,7 @@ int main(int argc, char* argv[])
 			checkCudaErrors( cufftXtExec(fft_plan, buffer + N*N*slice, buffer + N*N*slice, CUFFT_INVERSE) );
 		}
 
-		// complex modulus - faster to loop outside kernel, for some reason
-		// TODO: reusing the first half of the buffer ... is this fine? not sure about that!!!
-		for (int slice = 0; slice < NUM_SLICES; slice++)
-		{
-			modulus_half2<<<N, N/2, 0, math_stream>>>(buffer + N*N*slice, (half *)buffer + N*N*slice);
-		}
+		batch_modulus<<<N, N/2, 0, math_stream>>>(buffer, modulus);
 
 		// start timer after first run, GPU "warmup"
 		if (frame == 0)
@@ -337,16 +341,13 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaStreamDestroy(math_stream) );
 	checkCudaErrors( cudaStreamDestroy(copy_stream) );
 
+	checkCudaErrors( cudaFree(buffers[0]) );
 	checkCudaErrors( cudaFree(buffers[1]) );
-
-	checkCudaErrors( cudaDeviceSynchronize() );
 
 	half_float::half *host_buffer;
 	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
 
-	checkCudaErrors( cudaMemcpy(host_buffer, buffers[0], NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
-
-	checkCudaErrors( cudaFree(buffers[0]) );
+	checkCudaErrors( cudaMemcpy(host_buffer, modulus, NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
 
 	if (argc == 2)
 	{
