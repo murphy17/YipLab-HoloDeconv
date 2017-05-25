@@ -35,6 +35,7 @@
 #define LAMBDA0 0.000488f
 #define SCALE 0.00097751711f // 1/(N-1)
 #define NUM_SLICES 128
+#define MAX_BLOCK_THREADS 1024
 
 typedef unsigned char byte;
 
@@ -164,17 +165,22 @@ void complex_modulus(cufftComplex *z, float *r)
 }
 
 
-// must launch BATCH_SIZE * N threads
+//dim3 grid_dims(N*N / (MAX_BLOCK_THREADS / NUM_SLICES));
+//dim3 block_dims(MAX_BLOCK_THREADS / NUM_SLICES, NUM_SLICES);
+//batch_multiply<<<grid_dims, block_dims, 0, math_stream>>>(d_psf, d_img);
 __global__
 void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 {
-	__shared__ cufftComplex cache[N];
+	// threadIdx.x = slice index
+	// threadIdx.y = element index
 
-	int inIdx = blockIdx.x * N + threadIdx.x;
-	int outIdx = blockIdx.x * N * NUM_SLICES + threadIdx.x;
-	int cacheIdx = threadIdx.x / NUM_SLICES;
+	// each thread block processes blockDims.x different elements of w
+	__shared__ cufftComplex cache[MAX_BLOCK_THREADS / NUM_SLICES];
 
-	if (threadIdx.x < N)
+	int inIdx = blockIdx.x * (MAX_BLOCK_THREADS / NUM_SLICES) + threadIdx.x;
+	int outIdx = threadIdx.y * (N*N) + inIdx;
+
+	if (threadIdx.y == 0)
 	{
 		cache[threadIdx.x] = w[inIdx];
 	}
@@ -182,12 +188,50 @@ void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 
 	cufftComplex a = z[outIdx];
 	float a_temp = a.y;
-	float ay_by = __fmul_rn(a_temp, cache[cacheIdx].y);
-	float ay_bx = __fmul_rn(a_temp, cache[cacheIdx].x);
+	float ay_by = __fmul_rn(a_temp, cache[threadIdx.x].y);
+	float ay_bx = __fmul_rn(a_temp, cache[threadIdx.x].x);
 	a_temp = a.x;
-	z[outIdx].x = __fmaf_rn(a_temp, cache[cacheIdx].x, -ay_by);
-	z[outIdx].y = __fmaf_rn(a_temp, cache[cacheIdx].y, ay_bx);
+
+	z[outIdx].x = __fmaf_rn(a_temp, cache[threadIdx.x].x, -ay_by);
+	z[outIdx].y = __fmaf_rn(a_temp, cache[threadIdx.x].y, ay_bx);
 }
+
+//__global__
+//void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+//{
+//	const int i = blockIdx.x;
+//	const int j = threadIdx.x;
+//
+//	cufftComplex b = w[i*N+j];
+//	float bx = b.x; float by = b.y; // just making sure
+//
+//	for (int k = 0; k < NUM_SLICES; k++)
+//	{
+//		cufftComplex a = z[i*N+j];
+//
+//		// this gives like 3% speedup
+////		asm(".reg .f32 ay_by;\n" // float ay_by
+////			".reg .f32 ay_bx;\n" // float ay_bx
+////			" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
+////			" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
+////			" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
+////			" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
+////			" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
+////			"+f"(by), "+f"(bx) : \
+////			"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
+////		z[i*N+j].x = bx;
+////		z[i*N+j].y = by;
+//
+//		float a_temp = a.y;
+//		float ay_by = __fmul_rn(a_temp, by);
+//		float ay_bx = __fmul_rn(a_temp, bx);
+//		a_temp = a.x;
+//		z[i*N+j].x = __fmaf_rn(a_temp, bx, -ay_by);
+//		z[i*N+j].y = __fmaf_rn(a_temp, by, ay_bx);
+//
+//		z += N*N;
+//	}
+//}
 
 int main(int argc, char *argv[])
 {
@@ -243,6 +287,10 @@ int main(int argc, char *argv[])
 	float *h_slices;
 	checkCudaErrors( cudaMallocHost((void **)&h_slices, NUM_SLICES*N*N*sizeof(float)) );
 
+	// setup multiply kernel
+	dim3 grid_dims(N*N / (MAX_BLOCK_THREADS / NUM_SLICES));
+	dim3 block_dims(MAX_BLOCK_THREADS / NUM_SLICES, NUM_SLICES);
+
 	for (int frame = 0; frame < num_frames; frame++)
 	{
 		// this would be a copy from a frame buffer on the Tegra
@@ -275,8 +323,7 @@ int main(int argc, char *argv[])
 //		}
 		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_FORWARD) );
 
-		// multiply
-		batch_multiply<<<N, N*NUM_SLICES, 0, math_stream>>>(d_psf, d_img);
+		batch_multiply<<<grid_dims, block_dims, 0, math_stream>>>(d_psf, d_img);
 
 //		for (int slice = 0; slice < NUM_SLICES; slice++)
 //		{
@@ -330,119 +377,3 @@ int main(int argc, char *argv[])
 
 	return 0;
 }
-
-/*
-typedef struct {
-// int N;
-float lambda0;
-float del_x;
-float del_y;
-float d_max;
-float d_min;
-float d_step;
-int n_batch;
-int n_frames;
-} params_t;
-// Populates frequency grid and vector of spacings.
-//void setup_vars(params_t params, af::array *grid, af::array *spacings)
-//{
-// int n_step = (params.d_max - params.d_min) / params.d_step;
-//    // build (symmetric?) path-length grid
-// af::array df = (af::iota(af::dim4(N, 1)) * (float)(N)/(float)(N-1)-N/2);
-//    *grid = af::tile(af::pow(df * params.del_x, 2), 1, N) + af::tile(af::pow(df * params.del_y, 2).T(), N, 1);
-//    *spacings = af::pow(af::range(af::dim4(n_step)) * params.d_step + params.d_min, 2);
-//}
-// Expands input image into slices, performs a reduction, and writes the result out.
-void process_image(params_t params, af::array &img, float *out_ptr, af::array &x_cube) //, af::array &grid, af::array &spacings)
-{
-af::array x(N, N, c32);
-// int n_step = spacings.dims(0);
-//    af::cfloat k0 = {0., (float)(-2. * af::Pi / params.lambda0)};
-//    af::cfloat k1 = {0., (float)(1. / params.lambda0)};
-af::cfloat unit = {0, 1};
-// FFT the input image
-af::array h_f = af::fft2(img);
-// phase shift it
-h_f = h_f * unit;
-int n_step = (params.d_max - params.d_min) / params.d_step;
-// process in batches to fit in memory
-// ... but this seems to entirely occupy the Tegra...
-for (int j = 0; j < n_step; j ++)
-{
-float z = params.d_min + j * params.d_step;
-af::sync();
-complex *d_x = (complex *)x.device<af::cfloat>();
-construct_psf_4fold<<<N/2, N/2>>>(z, d_x);
-cudaDeviceSynchronize();
-x.unlock();
-// x = af::sqrt(grid + params.d_min + i * params.d_step); // ~0.15sec
-// x = k1 * af::exp(k0 * x) / x; // g
-af::fft2InPlace(x); // g_f // 0.3sec
-// note here: g is an even function
-// so F(g) is real valued and even
-// (i.e. can I just take FFT of half of g?)
-x = x * h_f; // gh_f
-af::ifft2InPlace(x); // h // 0.4sec
-// x = af::shift(x, x.dims(0)/2, x.dims(1)/2); // FFT shift
-x_cube(af::span, af::span, j) = af::abs(x); // / af::max<float>(x) * 255.; // compression probably unnecessary?
-}
-// simulate doing some reduction operation that returns a single image per cube
-// i.e. find optimal focus -> construct 3D volume
-af::array x_sum = af::sum(x_cube, 2);
-// push to host
-x_sum.host(out_ptr);
-}
-int main(void)
-{
-// setup experimental parameters
-    params_t params;
-//    N = 1024; // resolution in pixels
-    params.lambda0 = 0.000488; // wavelength
-    params.del_x = 5.32 / 1024; // horizontal frequency spacing
-    params.del_y = 6.66 / 1280; // vertical frequency spacing
-    params.d_max = 130; // max distance from CCD to object, mm
-    params.d_min = 30; // min distance from CCD to object, mm
-    params.d_step = 1; // step size in mm
-    int N_batch = 1; // number of frames per batch; best performance with 1!?!?
-    int N_frames = 3; // currently, just repeats the analysis
-    // load in test image
-    cv::Mat mat = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
-    mat.convertTo(mat, CV_32FC1);
-    // simulate a DMA buffer on the GPU, i.e. feeding in from video camera
-    // will copy in the images as part of the main loop, simulate 'streaming'
-    float *img_ptr;
-    cudaMalloc((void **)&img_ptr, N * N * sizeof(float));
-    // allocate the matrix using our predefined staging area
-    af::array img(N, N, img_ptr, afDevice);
-    af::eval(img);
-    // pin buffer on the host
-    float *h_ptr = af::pinned<float>(N * N * N_frames);
-//    af::array grid;
-//    af::array spacings;
-//    setup_vars(params, &grid, &spacings);
-    // allocate this just once and reuse, it's huge
-//    int n_step = spacings.dims(0);
-    int n_step = (params.d_max - params.d_min) / params.d_step;
-    af::array x_cube(N, N, n_step, f32);
-    for (int k = 0; k < N_frames; k++)
-    {
-// 'copy the image' - these would be successive frames in reality, and would probably live on GPU
-// i.e. this copy would not happen
-// mat = mat + 0.; // no possibility of caching
-cudaMemcpy(img_ptr, mat.data, N * N * sizeof(float), cudaMemcpyHostToDevice);
-// expand the image into slices, do a reduction, save result to h_ptr
-af::timer::start();
-process_image(params, img, h_ptr + N * N * k, x_cube); //, grid, spacings);
-std::cout << af::timer::stop() << std::endl;
-    }
-    cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
-    for (int i = 0; i < n_step; i++)
-    {
-        cv::Mat mat(cv::Size(1024, 1024), CV_32FC1, h_ptr + i * N * N);
-        cv::normalize(mat, mat, 1.0, 0.0, cv::NORM_MINMAX, -1);
-        cv::imshow("Display window", mat); // Show our image inside it.
-        cv::waitKey(0);
-    }
-    return 0;
-}
-*/
