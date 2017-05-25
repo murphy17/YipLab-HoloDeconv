@@ -20,12 +20,11 @@
 #include "common.h"
 
 #define N 1024
-#define LOG2N 10
 #define DX (5.32f / 1024.f)
 #define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
-#define SCALE 0.00097751711f // 1/(N-1)
 #define NUM_SLICES 100 // 100
+#define MAX_BLOCK_THREADS 1024
 
 typedef unsigned char byte;
 
@@ -71,8 +70,9 @@ void construct_psf(float z, half2 *g, float norm)
 	const int jj = (N - 1) - j;
 
 	// not sure whether the expansion of N/(N-1) was necessary
-	float x = (i * SCALE + i - N/2) * DX;
-	float y = (j * SCALE + j - N/2) * DY;
+	float scale = (float)N / (float)(N-1);
+	float x = (i * scale - N/2) * DX;
+	float y = (j * scale - N/2) * DY;
 
 	// could omit negation here, symmetries of trig functions take care of it
 	float r = (-2.f / LAMBDA0) * norm3df(x, y, z);
@@ -113,36 +113,6 @@ void frequency_shift(half2 *data)
 	data[i*N+j] = __hmul2(data[i*N+j], __float2half2_rn(a));
 }
 
-//__global__
-//void batch_multiply(half2 *z, const __restrict__ half2 *w)
-//{
-//	// threadIdx.x = slice index
-//	// threadIdx.y = element index
-//
-//	// each thread block processes blockDims.x different elements of w
-//	__shared__ half2 cache[MAX_BLOCK_THREADS / NUM_SLICES];
-//
-//	int inIdx = blockIdx.x * blockDim.x + threadIdx.x; // blockDim.x  (MAX_BLOCK_THREADS / NUM_SLICES)
-//	int outIdx = threadIdx.y * (N*N) + inIdx;
-////	int outIdx = threadIdx.y + inIdx * NUM_SLICES; // same elements in successive slices adjacent in memory
-//	// ^^^ this is wrong! threads are adjacent in x, not y!
-//
-//	if (threadIdx.y == 0)
-//	{
-//		cache[threadIdx.x] = w[inIdx];
-//	}
-//	__syncthreads();
-//
-//	half2 a = z[outIdx];
-//	float a_temp = a.y;
-//	float ay_by = __fmul_rn(a_temp, cache[threadIdx.x].y);
-//	float ay_bx = __fmul_rn(a_temp, cache[threadIdx.x].x);
-//	a_temp = a.x;
-//
-//	z[outIdx].x = __fmaf_rn(a_temp, cache[threadIdx.x].x, -ay_by);
-//	z[outIdx].y = __fmaf_rn(a_temp, cache[threadIdx.x].y, ay_bx);
-//}
-
 __global__
 void batch_multiply(half2 *z, const __restrict__ half2 *w)
 {
@@ -155,10 +125,6 @@ void batch_multiply(half2 *z, const __restrict__ half2 *w)
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
 		half2 z_ij = z[i*N+j];
-
-		// figure out if c_x, c_y can be packed
-
-		// speedup? from http://mathworld.wolfram.com/ComplexMultiplication.html
 
 		// z = a + ib, w = c + id
 		half2 ac_bd = __hmul2(z_ij, w_ij);
@@ -223,7 +189,7 @@ int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 3;
+	int num_frames = 10;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -270,13 +236,14 @@ int main(int argc, char* argv[])
 		float z = z_min + z_step * slice;
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
+		// ... which is no longer necessary because it's only generated once
 		construct_psf<<<N/2, N/2, 0, math_stream>>>(z, psf, -2.f * z / LAMBDA0 / N);
 
 		// FFT in-place
 		checkCudaErrors( cufftXtExec(fft_plan, psf, psf, CUFFT_FORWARD) );
 
 		// do the frequency shift here instead, complex multiplication commutes
-		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
+		// this is subtle - shifting in conjugate domain means we don't need to FFT shift (i.e. copy) later
 		frequency_shift<<<N, N, 0, math_stream>>>(psf);
 
 		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(half2), cudaMemcpyDeviceToHost, math_stream) );
