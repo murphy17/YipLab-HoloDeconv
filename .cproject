@@ -35,12 +35,13 @@
 								<option id="nvcc.compiler.usefastmath.516495862" name="Make use of fast math library (-use_fast_math)" superClass="nvcc.compiler.usefastmath" value="true" valueType="boolean"/>
 								<option id="nvcc.compiler.option.lineinfo.1456876838" name="Generate line-number information for device code (-lineinfo)" superClass="nvcc.compiler.option.lineinfo" value="false" valueType="boolean"/>
 								<option id="nvcc.compiler.ftz.866313158" name="Flush denormal values to zero in single-precision FP operations (-ftz)" superClass="nvcc.compiler.ftz" value="false" valueType="boolean"/>
-								<option id="nvcc.compiler.compileroptions.606601589" superClass="nvcc.compiler.compileroptions" valueType="stringList">
+								<option id="nvcc.compiler.compileroptions.606601589" name="Preprocessor options (-Xcompiler)" superClass="nvcc.compiler.compileroptions" valueType="stringList">
 									<listOptionValue builtIn="false" value="-O3"/>
 								</option>
-								<option id="nvcc.compiler.ptxasoptions.99120477" superClass="nvcc.compiler.ptxasoptions" valueType="stringList">
+								<option id="nvcc.compiler.ptxasoptions.99120477" name="ptaxas options (-Xptxas)" superClass="nvcc.compiler.ptxasoptions" valueType="stringList">
 									<listOptionValue builtIn="false" value="-O3"/>
 								</option>
+								<option id="nvcc.compiler.option.gprof.452093925" name="Generate gprof information (-pg)" superClass="nvcc.compiler.option.gprof" value="false" valueType="boolean"/>
 								<inputType id="nvcc.compiler.input.cu.245120728" superClass="nvcc.compiler.input.cu"/>
 								<inputType id="nvcc.compiler.input.cpp.1961910211" superClass="nvcc.compiler.input.cpp"/>
 								<inputType id="nvcc.compiler.input.c.448671280" superClass="nvcc.compiler.input.c"/>

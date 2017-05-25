@@ -115,65 +115,6 @@ void frequency_shift(cufftComplex *data)
 	data[i*N+j].y *= a;
 }
 
-__device__ __forceinline__
-void _mul(void *dataOut, size_t offset, cufftComplex a, void *callerInfo, void *sharedPtr)
-{
-	float bx = ((cufftComplex *)callerInfo)[offset].x;
-	float by = ((cufftComplex *)callerInfo)[offset].y;
-
-//	asm(".reg .f32 ay_by;\n" // float ay_by
-//		".reg .f32 ay_bx;\n" // float ay_bx
-//		" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
-//		" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
-//		" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
-//		" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
-//		" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
-//		"+f"(by), "+f"(bx) : \
-//		"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
-
-	float a_temp = a.y;
-	float ay_by = __fmul_rn(a_temp, by);
-	float ay_bx = __fmul_rn(a_temp, bx);
-	a_temp = a.x;
-	bx = __fmaf_rn(a_temp, bx, -ay_by);
-	by = __fmaf_rn(a_temp, by, ay_bx);
-
-	((cufftComplex *)dataOut)[offset].x = bx;
-	((cufftComplex *)dataOut)[offset].y = by;
-}
-__device__
-cufftCallbackStoreC d_mul = _mul;
-
-//__global__
-//void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
-//{
-//	// threadIdx.x = slice index
-//	// threadIdx.y = element index
-//
-//	// each thread block processes blockDims.x different elements of w
-//	__shared__ cufftComplex cache[MAX_BLOCK_THREADS / NUM_SLICES];
-//
-//	int inIdx = blockIdx.x * blockDim.x + threadIdx.x; // blockDim.x  (MAX_BLOCK_THREADS / NUM_SLICES)
-//	int outIdx = threadIdx.y * (N*N) + inIdx;
-////	int outIdx = threadIdx.y + inIdx * NUM_SLICES; // same elements in successive slices adjacent in memory
-//	// ^^^ this is wrong! threads are adjacent in x, not y!
-//
-//	if (threadIdx.y == 0)
-//	{
-//		cache[threadIdx.x] = w[inIdx];
-//	}
-//	__syncthreads();
-//
-//	cufftComplex a = z[outIdx];
-//	float a_temp = a.y;
-//	float ay_by = __fmul_rn(a_temp, cache[threadIdx.x].y);
-//	float ay_bx = __fmul_rn(a_temp, cache[threadIdx.x].x);
-//	a_temp = a.x;
-//
-//	z[outIdx].x = __fmaf_rn(a_temp, cache[threadIdx.x].x, -ay_by);
-//	z[outIdx].y = __fmaf_rn(a_temp, cache[threadIdx.x].y, ay_bx);
-//}
-
 __global__
 void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 {
@@ -186,19 +127,6 @@ void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
 		cufftComplex a = z[i*N+j];
-
-		// this gives like 3% speedup
-//		asm(".reg .f32 ay_by;\n" // float ay_by
-//			".reg .f32 ay_bx;\n" // float ay_bx
-//			" mul .f32 ay_by, %2, %0;\n" // ay_by = __fmul_rn(ay, by)
-//			" mul .f32 ay_bx, %2, %1;\n" // ay_bx = __fmul_rn(ay, bx)
-//			" neg .f32 ay_by, ay_by;\n" // ay_by = -ay_by
-//			" fma.rn .f32 %1, %3, %1, ay_by;\n" // bx = __fmaf_rn(ax, bx, ay_by);
-//			" fma.rn .f32 %0, %3, %0, ay_bx;\n" : \
-//			"+f"(by), "+f"(bx) : \
-//			"f"(a.y), "f"(a.x)); // by = __fmaf_rn(ax, by, ay_bx);
-//		z[i*N+j].x = bx;
-//		z[i*N+j].y = by;
 
 		float a_temp = a.y;
 		float ay_by = __fmul_rn(a_temp, by);
@@ -269,8 +197,8 @@ int main(int argc, char* argv[])
 	cufftHandle fft_plans[num_streams];
 
 	// setup multiply kernel
-//	dim3 grid_dims(N*N / (MAX_BLOCK_THREADS / NUM_SLICES));
-//	dim3 block_dims(MAX_BLOCK_THREADS / NUM_SLICES, NUM_SLICES);
+	dim3 grid_dims(N*N / (MAX_BLOCK_THREADS / NUM_SLICES));
+	dim3 block_dims(MAX_BLOCK_THREADS / NUM_SLICES, NUM_SLICES);
 
 	// TODO: investigate properly batched FFTs
 	// (does space requirement increase? if so don't)
@@ -365,36 +293,36 @@ int main(int argc, char* argv[])
 
 	// Tegra runs out of memory when I try to visualize...
 
-	checkCudaErrors( cudaFree(image) );
-	checkCudaErrors( cudaFree(psf) );
-	checkCudaErrors( cudaFreeHost(host_psf) );
-
-	for (int i = 0; i < num_streams; i++)
-	{
-		checkCudaErrors( cufftDestroy(fft_plans[i]) );
-		checkCudaErrors( cudaStreamDestroy(streams[i]) );
-		// checkCudaErrors( cudaFree(stream_buffers[i]) );
-	}
-
-	checkCudaErrors( cudaFree(stream_buffers[1]) );
-
-	checkCudaErrors( cudaDeviceSynchronize() );
-
-	float *host_buffer;
-	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
-
-	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], buffer_size, cudaMemcpyDeviceToHost) );
-
-	checkCudaErrors( cudaFree(stream_buffers[0]) );
-
-	if (argc == 2)
-	{
-		for (int slice = 0; slice < NUM_SLICES; slice++)
-		{
-			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
-			imshow(B);
-		}
-	}
+//	checkCudaErrors( cudaFree(image) );
+//	checkCudaErrors( cudaFree(psf) );
+//	checkCudaErrors( cudaFreeHost(host_psf) );
+//
+//	for (int i = 0; i < num_streams; i++)
+//	{
+//		checkCudaErrors( cufftDestroy(fft_plans[i]) );
+//		checkCudaErrors( cudaStreamDestroy(streams[i]) );
+//		// checkCudaErrors( cudaFree(stream_buffers[i]) );
+//	}
+//
+//	checkCudaErrors( cudaFree(stream_buffers[1]) );
+//
+//	checkCudaErrors( cudaDeviceSynchronize() );
+//
+//	float *host_buffer;
+//	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
+//
+//	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], buffer_size, cudaMemcpyDeviceToHost) );
+//
+//	checkCudaErrors( cudaFree(stream_buffers[0]) );
+//
+//	if (argc == 2)
+//	{
+//		for (int slice = 0; slice < NUM_SLICES; slice++)
+//		{
+//			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
+//			imshow(B);
+//		}
+//	}
 
 	// TODO: reimplement cleanup code once satisfied with implementation
 
