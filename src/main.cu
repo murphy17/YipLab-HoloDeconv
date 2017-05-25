@@ -7,16 +7,10 @@
  *
  */
 
-// FFT batching
-// async memory transfer
-// half-precision
-// texture memory
-
-// microoptimisation: replace x * N with x << LOG2N
-
-// should make some wrappers for the kernels, would make some decisions clearer
-
-// This fails to run with 5.2 CC...
+// this is the fastest yet on Tegra, keeping PSF on device gives fastest yet on Titan
+// ... consumes a TON of memory. immediately fills the Tegra
+// could serialize batches of slices, I suppose - hiding latency of multiply is main thing
+// ... I've got an experiment for the multiply in the works, would require transposing the PSF cube though
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
