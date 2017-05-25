@@ -217,7 +217,6 @@ int main(int argc, char* argv[])
 	int num_frames = 3;
 	float z_min = 30;
 	float z_step = 1;
-	int num_streams = 2;
 
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
@@ -235,28 +234,22 @@ int main(int argc, char* argv[])
 	byte *image_u8;
 	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
 
-	cudaStream_t streams[num_streams];
-	half2 *stream_buffers[num_streams];
-	cufftHandle fft_plans[num_streams];
+	cudaStream_t math_stream, copy_stream;
+	checkCudaErrors( cudaStreamCreate(&math_stream) );
+	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
-	// setup multiply kernel
-//	dim3 grid_dims(N*N / (MAX_BLOCK_THREADS / NUM_SLICES));
-//	dim3 block_dims(MAX_BLOCK_THREADS / NUM_SLICES, NUM_SLICES);
+	half2 *buffers[2];
+	checkCudaErrors( cudaMalloc((void **)&buffers[0], buffer_size) );
+	checkCudaErrors( cudaMalloc((void **)&buffers[1], buffer_size) );
 
-	// TODO: investigate properly batched FFTs
-	// (does space requirement increase? if so don't)
-	for (int i = 0; i < num_streams; i++)
-	{
-		checkCudaErrors( cudaStreamCreate(&streams[i]) );
-		checkCudaErrors( cufftCreate(&fft_plans[i]) );
-		checkCudaErrors( cufftXtMakePlanMany( \
-				fft_plans[i], 2, dims, \
-				NULL, 1, 0, CUDA_C_16F, \
-				NULL, 1, 0, CUDA_C_16F, \
-				1, &work_sizes, CUDA_C_16F) );
-		checkCudaErrors( cufftSetStream(fft_plans[i], streams[i]) );
-		checkCudaErrors( cudaMalloc((void **)&stream_buffers[i], buffer_size) );
-	}
+	cufftHandle fft_plan;
+	checkCudaErrors( cufftCreate(&fft_plan) );
+	checkCudaErrors( cufftXtMakePlanMany( \
+			fft_plan, 2, dims, \
+			NULL, 1, 0, CUDA_C_16F, \
+			NULL, 1, 0, CUDA_C_16F, \
+			1, &work_sizes, CUDA_C_16F) );
+	checkCudaErrors( cufftSetStream(fft_plan, math_stream) );
 
 	// cache the PSF host-side
 	// this causes problems for Titan (separate memory), but ~10% speedup for Tegra
@@ -265,16 +258,16 @@ int main(int argc, char* argv[])
 		float z = z_min + z_step * slice;
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
-		construct_psf<<<N/2, N/2, 0, streams[0]>>>(z, psf, -2.f * z / LAMBDA0 / N);
+		construct_psf<<<N/2, N/2, 0, math_stream>>>(z, psf, -2.f * z / LAMBDA0 / N);
 
 		// FFT in-place
-		checkCudaErrors( cufftXtExec(fft_plans[0], psf, psf, CUFFT_FORWARD) );
+		checkCudaErrors( cufftXtExec(fft_plan, psf, psf, CUFFT_FORWARD) );
 
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
-		frequency_shift<<<N, N, 0, streams[0]>>>(psf);
+		frequency_shift<<<N, N, 0, math_stream>>>(psf);
 
-		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(half2), cudaMemcpyDeviceToHost, streams[0]) );
+		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(half2), cudaMemcpyDeviceToHost, math_stream) );
 	}
 
 	// this would be a copy from a frame buffer on the Tegra
@@ -282,46 +275,47 @@ int main(int argc, char* argv[])
 
 	volatile bool frameReady = true; // this would be updated by the camera
 
+	// initialize the buffer for the first frame
+	checkCudaErrors( cudaMemcpyAsync(buffers[0], host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
+
 	for (int frame = 0; frame < num_frames; frame++)
 	{
-		int stream_num = frame % num_streams;
-		cudaStream_t stream = streams[stream_num];
-		half2 *buffer = stream_buffers[stream_num];
+		half2 *buffer = buffers[frame % 2];
 
 		// wait for a frame...
 		while (!frameReady) { ; }
 		// ... and copy
-		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, stream) );
+		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, math_stream) );
 
 		// this is on the host so the copy doesn't occupy GPU
 		// because the call is non-blocking, it means PSF copy for *next* frame gets cued up immediately
-		checkCudaErrors( cudaMemcpyAsync(buffer, host_psf, buffer_size, cudaMemcpyHostToDevice, stream) );
+		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
+		checkCudaErrors( cudaMemcpyAsync(buffer, host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
 
 		// up-cast to complex
-		byte_to_half2<<<N, N, 0, stream>>>(image_u8, image);
-		normalize_by<<<N, N, 0, stream>>>(image, N);
+		byte_to_half2<<<N, N, 0, math_stream>>>(image_u8, image);
+		normalize_by<<<N, N, 0, math_stream>>>(image, N);
 
 		// FFT the image in-place
-		checkCudaErrors( cufftXtExec(fft_plans[stream_num], image, image, CUFFT_FORWARD) );
-		normalize_by<<<N, N, 0, stream>>>(image, N);
+		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
+		normalize_by<<<N, N, 0, math_stream>>>(image, N);
 
 		// batch-multiply with FFT'ed image
-		batch_multiply<<<N, N, 0, stream>>>(buffer, image);
-//		batch_multiply<<<grid_dims, block_dims, 0, stream>>>(buffer, image);
+		batch_multiply<<<N, N, 0, math_stream>>>(buffer, image);
 
 		// inverse FFT that product
 		// TODO: doing the modulus in here as callback would be quite nice, would like to retry
 		// I have yet to see any speedup from batching the FFTs
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			checkCudaErrors( cufftXtExec(fft_plans[stream_num], buffer + N*N*slice, buffer + N*N*slice, CUFFT_INVERSE) );
+			checkCudaErrors( cufftXtExec(fft_plan, buffer + N*N*slice, buffer + N*N*slice, CUFFT_INVERSE) );
 		}
 
 		// complex modulus - faster to loop outside kernel, for some reason
 		// TODO: reusing the first half of the buffer ... is this fine? not sure about that!!!
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			modulus_half2<<<N, N, 0, stream>>>(buffer + N*N*slice, (half *)buffer + N*N*slice);
+			modulus_half2<<<N, N, 0, math_stream>>>(buffer + N*N*slice, (half *)buffer + N*N*slice);
 		}
 
 		// start timer after first run, GPU "warmup"
