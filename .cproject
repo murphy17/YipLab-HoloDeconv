@@ -37,10 +37,14 @@
 								<option id="nvcc.compiler.ftz.866313158" name="Flush denormal values to zero in single-precision FP operations (-ftz)" superClass="nvcc.compiler.ftz" value="false" valueType="boolean"/>
 								<option id="nvcc.compiler.ptxasoptions.119059216" name="ptaxas options (-Xptxas)" superClass="nvcc.compiler.ptxasoptions" valueType="stringList">
 									<listOptionValue builtIn="false" value="-O3"/>
+									<listOptionValue builtIn="false" value="--warn-on-double-precision-use"/>
+									<listOptionValue builtIn="false" value="--warn-on-local-memory-usage"/>
+									<listOptionValue builtIn="false" value="--warn-on-spills"/>
 								</option>
 								<option id="nvcc.compiler.compileroptions.529489996" name="Preprocessor options (-Xcompiler)" superClass="nvcc.compiler.compileroptions" valueType="stringList">
 									<listOptionValue builtIn="false" value="-O3"/>
 								</option>
+								<option id="nvcc.compiler.maxregcount.99308975" name="Maximum number of registers (-maxrregcount)" superClass="nvcc.compiler.maxregcount" value="" valueType="string"/>
 								<inputType id="nvcc.compiler.input.cu.245120728" superClass="nvcc.compiler.input.cu"/>
 								<inputType id="nvcc.compiler.input.cpp.1961910211" superClass="nvcc.compiler.input.cpp"/>
 								<inputType id="nvcc.compiler.input.c.448671280" superClass="nvcc.compiler.input.c"/>

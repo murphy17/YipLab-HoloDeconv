@@ -7,11 +7,6 @@
  *
  */
 
-// this is the fastest yet on Tegra, keeping PSF on device gives fastest yet on Titan
-// ... consumes a TON of memory. immediately fills the Tegra
-// could serialize batches of slices, I suppose - hiding latency of multiply is main thing
-// ... I've got an experiment for the multiply in the works, would require transposing the PSF cube though
-
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/gpu/gpu.hpp>
