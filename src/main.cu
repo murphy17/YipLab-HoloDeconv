@@ -24,7 +24,6 @@
 #define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
 #define NUM_SLICES 100 // 100
-#define MAX_BLOCK_THREADS 1024
 
 typedef unsigned char byte;
 
@@ -268,7 +267,7 @@ int main(int argc, char* argv[])
 
 		// start copying the PSF for the next frame
 		// this is on the host so the copy doesn't occupy GPU
-		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
+		checkCudaErrors( cudaStreamSynchronize(copy_stream) ); // wait for previous copy to finish if it hasn't
 		checkCudaErrors( cudaMemcpyAsync(buffers[(frame + 1) % 2], host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
 
 		// up-cast to complex
@@ -282,8 +281,7 @@ int main(int argc, char* argv[])
 		// batch-multiply with FFT'ed image
 		batch_multiply<<<N, N, 0, math_stream>>>(buffer, image);
 
-		// inverse FFT that product
-		// I have yet to see any speedup from batching the FFTs
+		// inverse FFT that product; cuFFT batching gave no speedup whatsoever and this permits plan reuse
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
 			checkCudaErrors( cufftXtExec(fft_plan, buffer + N*N*slice, buffer + N*N*slice, CUFFT_INVERSE) );
