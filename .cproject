@@ -45,7 +45,7 @@
 									<listOptionValue builtIn="false" value="opencv_imgcodecs"/>
 									<listOptionValue builtIn="false" value="culibos"/>
 									<listOptionValue builtIn="false" value="cublas"/>
-									<listOptionValue builtIn="false" value="cufft_static"/>
+									<listOptionValue builtIn="false" value="cufft"/>
 									<listOptionValue builtIn="false" value="opencv_highgui"/>
 								</option>
 								<option id="nvcc.linker.option.paths.1999860882" name="Library search path (-L)" superClass="nvcc.linker.option.paths" valueType="libPaths">
@@ -65,11 +65,13 @@
 				</configuration>
 			</storageModule>
 			<storageModule moduleId="com.nvidia.cuda.ide.build.project.ICudaProjectConfiguration">
-				<executable devicelink="true">
+				<executable devicelink="false">
+					<ptx major="5" minor="3"/>
+					<sass major="5" minor="3"/>
 					<ptx major="6" minor="0"/>
 					<sass major="6" minor="0"/>
 				</executable>
-				<editor-arch major="6" minor="0"/>
+				<editor-arch major="5" minor="3"/>
 			</storageModule>
 			<storageModule moduleId="org.eclipse.cdt.core.externalSettings"/>
 		</cconfiguration>

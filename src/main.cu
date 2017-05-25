@@ -20,8 +20,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-//#include <opencv2/gpu/gpu.hpp>
-#include <opencv2/core/cuda.hpp>
+#include <opencv2/gpu/gpu.hpp>
+//#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -49,7 +49,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::cuda::GpuMat in)
+void imshow(cv::gpu::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -59,7 +59,7 @@ void imshow(cv::cuda::GpuMat in)
 	{
 		cv::Mat channels[2];
 		cv::split(out, channels);
-		cv::magnitude(channels[0], channels[1  ], out);
+		cv::magnitude(channels[0], channels[1], out);
 	}
 	out.convertTo(out, CV_32FC1);
 	cv::normalize(out, out, 1.0, 0.0, cv::NORM_MINMAX, -1);
@@ -197,11 +197,20 @@ void complex_modulus(cufftComplex *z, float *r)
 	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
 }
 
+__global__
+void copy_buffer(cufftComplex *a, cufftComplex *b)
+{
+	const int i = blockIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
+
+	b[i*N+j] = a[i*N+j];
+}
+
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 5;
+	int num_frames = 3;
 	float z_min = 30;
 	float z_step = 1;
 	int num_streams = 2;
@@ -213,15 +222,14 @@ int main(int argc, char* argv[])
 	cufftComplex *image;
 	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(cufftComplex)) );
 	cufftComplex *psf;
-	checkCudaErrors( cudaMalloc((void **)&image, buffer_size) );
+	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(cufftComplex)) );
+	// allocate this on the host - that way CPU can manage transfer, not GPU, lets it run in async
+	// (this is 3x slower on Titan, but faster on Tegra - recall that host and GPU memory are the same thing in Tegra)
+	cufftComplex *host_psf;
+	checkCudaErrors( cudaMallocHost((void **)&host_psf, buffer_size) );
 
 	byte *image_u8;
 	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
-
-	// wouldn't exist in streaming application
-	// don't do the copy in performance testing, also this is a LOT of memory to pin
-	float *host_buffer;
-	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
 
 	cudaStream_t streams[num_streams];
 	cufftComplex *stream_buffers[num_streams];
@@ -249,15 +257,22 @@ int main(int argc, char* argv[])
 		float z = z_min + z_step * slice;
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
-		construct_psf<<<N/2, N/2, 0, math_stream>>>(z, d_psf + N*N*slice, -2.f * z / LAMBDA0);
+		construct_psf<<<N/2, N/2, 0, streams[0]>>>(z, psf, -2.f * z / LAMBDA0);
 
 		// FFT in-place
-		checkCudaErrors( cufftXtExec(plan, d_psf + N*N*slice, d_psf + N*N*slice, CUFFT_FORWARD) );
+		checkCudaErrors( cufftXtExec(fft_plans[0], psf, psf, CUFFT_FORWARD) );
 
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
-		frequency_shift<<<N, N>>>(d_psf + N*N*slice);
+		frequency_shift<<<N, N, 0, streams[0]>>>(psf);
+
+		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(cufftComplex), cudaMemcpyDeviceToHost, streams[0]) );
 	}
+
+	// this would be a copy from a frame buffer on the Tegra
+	cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
+
+	volatile bool frameReady = true; // this would be updated by the camera
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
@@ -265,12 +280,14 @@ int main(int argc, char* argv[])
 		cudaStream_t stream = streams[stream_num];
 		cufftComplex *buffer = stream_buffers[stream_num];
 
-		// this would be a copy from a frame buffer on the Tegra
-		// this is a blocking call, simulate waiting for a frame
-		cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
-
-		// non-blocking call - copy for *next* frame gets immediately cued after this one
+		// wait for a frame...
+		while (!frameReady) { ; }
+		// ... and copy
 		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, stream) );
+
+		// this is on the host so the copy doesn't occupy GPU
+		// because the call is non-blocking, it means PSF copy for *next* frame gets cued up immediately
+		checkCudaErrors( cudaMemcpyAsync(buffer, host_psf, buffer_size, cudaMemcpyHostToDevice, stream) );
 
 		// up-cast to complex
 		byte_to_complex<<<N, N, 0, stream>>>(image_u8, image);
@@ -278,16 +295,12 @@ int main(int argc, char* argv[])
 		// FFT the image in-place
 		checkCudaErrors( cufftExecC2C(fft_plans[stream_num], image, image, CUFFT_FORWARD) );
 
-		// load the PSFs into working area
-		checkCudaErrors( cudaMemcpyAsync(buffer, psf, buffer_size, cudaMemcpyDeviceToDevice, stream) );
-
 		// batch-multiply with FFT'ed image
 		batch_multiply<<<N, N, 0, stream>>>(buffer, image);
 
 		// inverse FFT that product
 		// TODO: doing the modulus in here as callback would be quite nice, would like to retry
 		// I have yet to see any speedup from batching the FFTs
-		// TODO: verify this is non-blocking
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
 			checkCudaErrors( cufftXtExec(fft_plans[stream_num], buffer + N*N*slice, buffer + N*N*slice, CUFFT_INVERSE) );
@@ -297,11 +310,11 @@ int main(int argc, char* argv[])
 		// TODO: reusing the first half of the buffer ... is this fine? not sure about that!!!
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			complex_modulus<<<N, N, 0, stream>>>(buffer + N*N*slice, (float)buffer + N*N*slice);
+			complex_modulus<<<N, N, 0, stream>>>(buffer + N*N*slice, (float *)buffer + N*N*slice);
 		}
 
 		// checkCudaErrors( cudaStreamSynchronize(streams[(frame - 1) % num_streams]) ); // this would not be needed!
-		checkCudaErrors( cudaMemcpyAsync(host_buffer, buffer, buffer_size, cudaMemcpyDeviceToHost, stream) );
+		// checkCudaErrors( cudaMemcpyAsync(host_buffer, buffer, buffer_size, cudaMemcpyDeviceToHost, stream) ); // holy shit this is slow
 
 		// start timer after first run, GPU "warmup"
 		if (frame == 0)
@@ -312,14 +325,36 @@ int main(int argc, char* argv[])
 
 	std::cout << cudaTimerStop() / (num_frames - 1) << "ms" << std::endl;
 
-	if (argc == 2)
-	{
-		for (int slice = 0; slice < NUM_SLICES; slice++)
-		{
-			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
-			imshow(B);
-		}
-	}
+	// Tegra runs out of memory when I try to visualize...
+
+//	checkCudaErrors( cudaFree(image) );
+//	checkCudaErrors( cudaFree(psf) );
+//	checkCudaErrors( cudaFreeHost(host_psf) );
+//
+//	for (int i = 0; i < num_streams; i++)
+//	{
+//		checkCudaErrors( cufftDestroy(fft_plans[i]) );
+//		checkCudaErrors( cudaStreamDestroy(streams[i]) );
+//		// checkCudaErrors( cudaFree(stream_buffers[i]) );
+//	}
+//
+//	checkCudaErrors( cudaFree(stream_buffers[1]) );
+//
+//	checkCudaErrors( cudaDeviceSynchronize() );
+//
+//	float *host_buffer;
+//	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
+//
+//	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], buffer_size, cudaMemcpyDeviceToHost) );
+//
+//	if (argc == 2)
+//	{
+//		for (int slice = 0; slice < NUM_SLICES; slice++)
+//		{
+//			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
+//			imshow(B);
+//		}
+//	}
 
 	// TODO: reimplement cleanup code once satisfied with implementation
 
