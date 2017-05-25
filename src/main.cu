@@ -31,7 +31,6 @@
 #define LAMBDA0 0.000488f
 #define SCALE 0.00097751711f // 1/(N-1)
 #define NUM_SLICES 100 // 100
-#define MAX_BLOCK_THREADS 1024
 
 typedef unsigned char byte;
 
@@ -155,26 +154,32 @@ void batch_multiply(half2 *z, const __restrict__ half2 *w)
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	half2 b = w[i*N+j];
-	half2 b_inv = __lowhigh2highlow(b);
+	half2 w_ij = w[i*N+j];
+	half2 w_ij_inv = __lowhigh2highlow(w_ij);
 
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
-		half2 a = z[i*N+j];
+		half2 z_ij = z[i*N+j];
 
 		// figure out if c_x, c_y can be packed
 
-		half2 temp = __hmul2(a, b);
-		half c_x = __hsub(__low2half(temp), __high2half(temp));
+		// speedup? from http://mathworld.wolfram.com/ComplexMultiplication.html
 
-		temp = __hmul2(a, b_inv);
-		half c_y = __hadd(__low2half(temp), __high2half(temp));
+		// z = a + ib, w = c + id
+		half2 ac_bd = __hmul2(z_ij, w_ij);
+		half re = __hsub(__low2half(ac_bd), __high2half(ac_bd));
 
-		z[i*N+j] = __halves2half2(c_x, c_y);
+		half2 ad_bc = __hmul2(z_ij, w_ij_inv);
+		half im = __hadd(__low2half(ad_bc), __high2half(ad_bc));
+
+		// transpose
+//		half2 ac_ad = __highs2half2(ac_bd, __hneg2(ad_bc));
+//		half2 bd_bc = __lows2half2(ac_bd, ad_bc);
+
+		z[i*N+j] = __halves2half2(re, im);
+//		z[i*N+j] = __hadd2(ac_ad, bd_bc);
 
 		z += N*N;
-
-		// __syncthreads(); // coalesce?
 	}
 }
 
@@ -191,14 +196,17 @@ __global__
 void modulus_half2(half2 *z, half *r)
 {
 	int i = blockIdx.x;
-	int j = threadIdx.x; // blockDim shall equal N
+	int j = threadIdx.x * 2; // blockDim shall equal N/2
 
-	half2 temp = __hmul2(z[i*N+j], z[i*N+j]); // this might saturate
-	r[i*N+j] = __hadd(__low2half(temp), __high2half(temp));
+	half2 ax_ay = __hmul2(z[i*N+j], z[i*N+j]);
+	half2 bx_by = __hmul2(z[i*N+j+1], z[i*N+j+1]);
 
-	// I'm a bit concerned about how those intrinsics expand
-	// too many instructions seems likely
-	// write your own?
+	// 'transpose'
+	half2 ax_bx = __highs2half2(ax_ay, bx_by);
+	half2 ay_by = __lows2half2(ax_ay, bx_by);
+
+	// full-byte stores
+	*(half2 *)&r[i*N+j] = h2sqrt(__hadd2(ax_bx, ay_by));
 }
 
 __global__
@@ -287,10 +295,10 @@ int main(int argc, char* argv[])
 		// ... and copy
 		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, math_stream) );
 
+		// start copying the PSF for the next frame
 		// this is on the host so the copy doesn't occupy GPU
-		// because the call is non-blocking, it means PSF copy for *next* frame gets cued up immediately
 		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
-		checkCudaErrors( cudaMemcpyAsync(buffer, host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
+		checkCudaErrors( cudaMemcpyAsync(buffers[(frame + 1) % 2], host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
 
 		// up-cast to complex
 		byte_to_half2<<<N, N, 0, math_stream>>>(image_u8, image);
@@ -304,7 +312,6 @@ int main(int argc, char* argv[])
 		batch_multiply<<<N, N, 0, math_stream>>>(buffer, image);
 
 		// inverse FFT that product
-		// TODO: doing the modulus in here as callback would be quite nice, would like to retry
 		// I have yet to see any speedup from batching the FFTs
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
@@ -315,7 +322,7 @@ int main(int argc, char* argv[])
 		// TODO: reusing the first half of the buffer ... is this fine? not sure about that!!!
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			modulus_half2<<<N, N, 0, math_stream>>>(buffer + N*N*slice, (half *)buffer + N*N*slice);
+			modulus_half2<<<N, N/2, 0, math_stream>>>(buffer + N*N*slice, (half *)buffer + N*N*slice);
 		}
 
 		// start timer after first run, GPU "warmup"
@@ -327,39 +334,34 @@ int main(int argc, char* argv[])
 
 	std::cout << cudaTimerStop() / (num_frames - 1) << "ms" << std::endl;
 
-	// Tegra runs out of memory when I try to visualize 100 slices...
+	checkCudaErrors( cudaFree(image) );
+	checkCudaErrors( cudaFree(psf) );
+	checkCudaErrors( cudaFreeHost(host_psf) );
 
-//	checkCudaErrors( cudaFree(image) );
-//	checkCudaErrors( cudaFree(psf) );
-//	checkCudaErrors( cudaFreeHost(host_psf) );
-//
-//	for (int i = 0; i < num_streams; i++)
-//	{
-//		checkCudaErrors( cufftDestroy(fft_plans[i]) );
-//		checkCudaErrors( cudaStreamDestroy(streams[i]) );
-//		// checkCudaErrors( cudaFree(stream_buffers[i]) );
-//	}
-//
-//	checkCudaErrors( cudaFree(stream_buffers[1]) );
-//
-//	checkCudaErrors( cudaDeviceSynchronize() );
-//
-//	half_float::half *host_buffer;
-//	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
-//
-//	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
-//
-//	checkCudaErrors( cudaFree(stream_buffers[0]) );
-//
-//	if (argc == 2)
-//	{
-//		for (int slice = 0; slice < NUM_SLICES; slice++)
-//		{
-//			cv::Mat B(N, N, CV_32FC1);
-//			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((host_buffer + N*N*slice)[i]); }
-//			imshow(B);
-//		}
-//	}
+	checkCudaErrors( cufftDestroy(fft_plan) );
+	checkCudaErrors( cudaStreamDestroy(math_stream) );
+	checkCudaErrors( cudaStreamDestroy(copy_stream) );
+
+	checkCudaErrors( cudaFree(buffers[1]) );
+
+	checkCudaErrors( cudaDeviceSynchronize() );
+
+	half_float::half *host_buffer;
+	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
+
+	checkCudaErrors( cudaMemcpy(host_buffer, buffers[0], NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
+
+	checkCudaErrors( cudaFree(buffers[0]) );
+
+	if (argc == 2)
+	{
+		for (int slice = 0; slice < NUM_SLICES; slice++)
+		{
+			cv::Mat B(N, N, CV_32FC1);
+			for (int i = 0; i < N*N; i++) { ((float *)(B.data))[i] = (float)((host_buffer + N*N*slice)[i]); }
+			imshow(B);
+		}
+	}
 
 	// TODO: reimplement cleanup code once satisfied with implementation
 

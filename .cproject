@@ -33,7 +33,7 @@
 								</option>
 								<option id="nvcc.compiler.cpp11option.455419389" name="Enable C++11 support (-std=c++11)" superClass="nvcc.compiler.cpp11option" value="true" valueType="boolean"/>
 								<option id="nvcc.compiler.usefastmath.516495862" name="Make use of fast math library (-use_fast_math)" superClass="nvcc.compiler.usefastmath" value="true" valueType="boolean"/>
-								<option id="nvcc.compiler.option.lineinfo.1456876838" name="Generate line-number information for device code (-lineinfo)" superClass="nvcc.compiler.option.lineinfo" value="false" valueType="boolean"/>
+								<option id="nvcc.compiler.option.lineinfo.1456876838" name="Generate line-number information for device code (-lineinfo)" superClass="nvcc.compiler.option.lineinfo" value="true" valueType="boolean"/>
 								<option id="nvcc.compiler.ftz.866313158" name="Flush denormal values to zero in single-precision FP operations (-ftz)" superClass="nvcc.compiler.ftz" value="false" valueType="boolean"/>
 								<option id="nvcc.compiler.ptxasoptions.119059216" name="ptaxas options (-Xptxas)" superClass="nvcc.compiler.ptxasoptions" valueType="stringList">
 									<listOptionValue builtIn="false" value="-O3"/>
