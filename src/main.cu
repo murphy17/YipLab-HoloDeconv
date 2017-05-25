@@ -163,16 +163,30 @@ void complex_modulus(cufftComplex *z, float *r)
 	r[i*N+j] = hypotf(z[i*N+j].x, z[i*N+j].y);
 }
 
+
+// must launch BATCH_SIZE * N threads
 __global__
-void batch_multiply(cufftComplex *z, cufftComplex *w)
+void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 {
-	cufftComplex b = w[blockIdx.x*N + threadIdx.x];
-	for (int slice = 0; slice < NUM_SLICES; slice++)
+	__shared__ cufftComplex cache[N];
+
+	int inIdx = blockIdx.x * N + threadIdx.x;
+	int outIdx = blockIdx.x * N * NUM_SLICES + threadIdx.x;
+	int cacheIdx = threadIdx.x / NUM_SLICES;
+
+	if (threadIdx.x < N)
 	{
-		cufftComplex a = z[slice*N*N + blockIdx.x*N + threadIdx.x];
-		z[slice*N*N + blockIdx.x*N + threadIdx.x].x = a.x * b.x - a.y * b.y;
-		z[slice*N*N + blockIdx.x*N + threadIdx.x].y = a.x * b.y + a.y * b.x;
+		cache[threadIdx.x] = w[inIdx];
 	}
+	__syncthreads();
+
+	cufftComplex a = z[outIdx];
+	float a_temp = a.y;
+	float ay_by = __fmul_rn(a_temp, cache[cacheIdx].y);
+	float ay_bx = __fmul_rn(a_temp, cache[cacheIdx].x);
+	a_temp = a.x;
+	z[outIdx].x = __fmaf_rn(a_temp, cache[cacheIdx].x, -ay_by);
+	z[outIdx].y = __fmaf_rn(a_temp, cache[cacheIdx].y, ay_bx);
 }
 
 int main(int argc, char *argv[])
@@ -262,7 +276,7 @@ int main(int argc, char *argv[])
 		checkCudaErrors( cufftExecC2C(plan, d_psf, d_psf, CUFFT_FORWARD) );
 
 		// multiply
-		batch_multiply<<<N, N, 0, math_stream>>>(d_psf, d_img);
+		batch_multiply<<<N, N*NUM_SLICES, 0, math_stream>>>(d_psf, d_img);
 
 //		for (int slice = 0; slice < NUM_SLICES; slice++)
 //		{
