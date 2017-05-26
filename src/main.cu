@@ -112,6 +112,23 @@ void frequency_shift(half2 *data)
 	data[i*N+j] = __hmul2(data[i*N+j], __float2half2_rn(a));
 }
 
+__device__ __forceinline__
+half2 _mul_helper(half2 z, half2 w, half2 w_inv)
+{
+	half2 ac_bd = __hmul2(z, w);
+	half re = __hsub(__low2half(ac_bd), __high2half(ac_bd));
+
+	half2 ad_bc = __hmul2(z, w_inv);
+	half im = __hadd(__low2half(ad_bc), __high2half(ad_bc));
+
+	// transpose
+//		half2 ac_ad = __highs2half2(ac_bd, __hneg2(ad_bc));
+//		half2 bd_bc = __lows2half2(ac_bd, ad_bc);
+//		z[i*N+j] = __hadd2(ac_ad, bd_bc);
+
+	return __halves2half2(re, im);
+}
+
 __global__
 void batch_multiply(half2 *z, const __restrict__ half2 *w)
 {
@@ -123,21 +140,47 @@ void batch_multiply(half2 *z, const __restrict__ half2 *w)
 
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
-		half2 z_ij = z[i*N+j];
+//		half2 z_ij = z[i*N+j];
+//
+//		// z = a + ib, w = c + id
+//		half2 ac_bd = __hmul2(z_ij, w_ij);
+//		half re = __hsub(__low2half(ac_bd), __high2half(ac_bd));
+//
+//		half2 ad_bc = __hmul2(z_ij, w_ij_inv);
+//		half im = __hadd(__low2half(ad_bc), __high2half(ad_bc));
+//
+//		z[i*N+j] = __halves2half2(re, im);
+		z[i*N+j] = _mul_helper(z[i*N+j], w_ij, w_ij_inv);
 
-		// z = a + ib, w = c + id
-		half2 ac_bd = __hmul2(z_ij, w_ij);
-		half re = __hsub(__low2half(ac_bd), __high2half(ac_bd));
+		z += N*N;
+	}
+}
 
-		half2 ad_bc = __hmul2(z_ij, w_ij_inv);
-		half im = __hadd(__low2half(ad_bc), __high2half(ad_bc));
+// also Hermitian symmetry of z
+// z[i,j] = conj(z[N-i,N-j])
+__global__
+void batch_multiply_sym(half2 *z, const __restrict__ half2 *w)
+{
+	const int i = blockIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
+	const int ii = (N - 1) - i;
+	const int jj = (N - 1) - j;
 
-		// transpose
-//		half2 ac_ad = __highs2half2(ac_bd, __hneg2(ad_bc));
-//		half2 bd_bc = __lows2half2(ac_bd, ad_bc);
+	half2 w_ = w[i*N+j];
+	half2 w_inv = __lowhigh2highlow(w_);
+	half2 w_neg = __hneg2(w_);
+	half2 w_inv_neg = __hneg2(w_inv);
 
-		z[i*N+j] = __halves2half2(re, im);
-//		z[i*N+j] = __hadd2(ac_ad, bd_bc);
+	// why doesn't this work!?! indexing must be wrong
+	for (int k = 0; k < NUM_SLICES; k++)
+	{
+		z[i*N+j] = _mul_helper(z[i*N+j], w_, w_inv);
+
+		z[i*N+jj] = _mul_helper(z[i*N+jj], w_neg, w_inv_neg);
+
+		z[ii*N+j] = _mul_helper(z[ii*N+j], w_neg, w_inv_neg);
+
+		z[ii*N+jj] = _mul_helper(z[ii*N+jj], w_, w_inv);
 
 		z += N*N;
 	}
@@ -188,7 +231,7 @@ int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 10;
+	int num_frames = 5;
 	float z_min = 30;
 	float z_step = 1;
 
@@ -248,6 +291,8 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(half2), cudaMemcpyDeviceToHost, math_stream) );
 	}
 
+	// !!! the psf has 4-fold symmetry. can store efficiently!
+
 	// this would be a copy from a frame buffer on the Tegra
 	cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
 
@@ -270,16 +315,21 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cudaStreamSynchronize(copy_stream) ); // wait for previous copy to finish if it hasn't
 		checkCudaErrors( cudaMemcpyAsync(buffers[(frame + 1) % 2], host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
 
-		// up-cast to complex
+		// cast to complex half
 		byte_to_half2<<<N, N, 0, math_stream>>>(image_u8, image);
+		// divide by N so FFT doesn't overflow
 		normalize_by<<<N, N, 0, math_stream>>>(image, N);
 
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
+		// again divide by N to avoid overflow
 		normalize_by<<<N, N, 0, math_stream>>>(image, N);
 
 		// batch-multiply with FFT'ed image
-		batch_multiply<<<N, N, 0, math_stream>>>(buffer, image);
+		batch_multiply_sym<<<N/2, N/2, 0, math_stream>>>(buffer, image);
+//		batch_multiply<<<N, N, 0, math_stream>>>(buffer, image);
+
+		// TODO: try C2R transform
 
 		// inverse FFT that product; cuFFT batching gave no speedup whatsoever and this permits plan reuse
 		for (int slice = 0; slice < NUM_SLICES; slice++)
