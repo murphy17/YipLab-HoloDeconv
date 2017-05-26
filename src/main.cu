@@ -7,6 +7,11 @@
  *
  */
 
+// the image FFT is Hermitian symmetric
+// and the PSF FFT is symmetric
+// could halve the number of FFT ops!
+// but this is proving very difficult to take advantage of
+
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/gpu/gpu.hpp>
