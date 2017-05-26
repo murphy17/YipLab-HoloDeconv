@@ -38,7 +38,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::gpu::GpuMat in)
+void imshow(cv::gpu::GpuMat in, bool log_scale = false)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -51,6 +51,8 @@ void imshow(cv::gpu::GpuMat in)
 		cv::magnitude(channels[0], channels[1], out);
 	}
 	out.convertTo(out, CV_32FC1);
+	if (log_scale)
+		cv::log(out, out);
 	cv::normalize(out, out, 1.0, 0.0, cv::NORM_MINMAX, -1);
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
@@ -60,15 +62,14 @@ void imshow(cv::gpu::GpuMat in)
 // exploits 4-fold symmetry (PSF is also radially symmetric, but that's harder...)
 // note that answer is scaled between +/-1
 __global__
-void construct_psf(float z, half2 *g, float norm)
+void construct_psf(float z, half *g_re, half *g_im, float norm)
 {
-	const int i = blockIdx.x;
-	const int j = threadIdx.x; // blockDim shall equal N
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
 
-	const int ii = (N - 1) - i;
-	const int jj = (N - 1) - j;
+	int ii = (N - 1) - i;
+	int jj = (N - 1) - j;
 
-	// not sure whether the expansion of N/(N-1) was necessary
 	float scale = (float)N / (float)(N-1);
 	float x = (i * scale - N/2) * DX;
 	float y = (j * scale - N/2) * DY;
@@ -90,13 +91,18 @@ void construct_psf(float z, half2 *g, float norm)
 	g_ij.y = __fdividef(re, r);
 
 	// cast to half-precision
-	half2 g_ij_fp16 = __floats2half2_rn(g_ij.x, g_ij.y);
+	half g_ij_re = __float2half(g_ij.x);
+	half g_ij_im = __float2half(g_ij.y);
 
-	// CUDA takes care of reversed-index coalescing, this is fine
-	g[i*N+j] = g_ij_fp16;
-	g[i*N+jj] = g_ij_fp16;
-	g[ii*N+j] = g_ij_fp16;
-	g[ii*N+jj] = g_ij_fp16;
+	// TODO: clean this mess up
+	g_re[i*N+j] = g_ij_re;
+	g_re[i*N+jj] = g_ij_re;
+	g_re[ii*N+j] = g_ij_re;
+	g_re[ii*N+jj] = g_ij_re;
+	g_im[i*N+j] = g_ij_im;
+	g_im[i*N+jj] = g_ij_im;
+	g_im[ii*N+j] = g_ij_im;
+	g_im[ii*N+jj] = g_ij_im;
 }
 
 // exploit Fourier duality to shift without copying
@@ -139,7 +145,7 @@ void batch_multiply(half2 *z, const __restrict__ half2 *w)
 		z[i*N+j] = __halves2half2(re, im);
 //		z[i*N+j] = __hadd2(ac_ad, bd_bc);
 
-		z += N*N;
+		z += N*(N/2+1);
 	}
 }
 
@@ -184,6 +190,62 @@ void normalize_by(half2 *h, float n)
 	h[i*N+j] = __hmul2(h[i*N+j], __float2half2_rn(1.f / n));
 }
 
+__global__
+void merge_filter_halves(half2 *x_f, half2 *y_f, half2 *z_f)
+{
+	const int i = blockIdx.x;
+	const int j = threadIdx.x;
+
+	// x = a+ib, y = c+id, z = x+iy
+	// re(z) = re(x+iy) = re(a+ib+ic-d) = a-d
+	// im(z) = im(x+iy) = im(a+ib+ic-d) = b+c
+
+	half a = __low2half(x_f[i*N+j]);
+	half b = __high2half(x_f[i*N+j]);
+	half c = __low2half(y_f[i*N+j]);
+	half d = __high2half(y_f[i*N+j]);
+
+	z_f[i*N+j] = __halves2half2(__hsub(a, d), __hadd(b, c));
+}
+
+// inefficient memory accesses - vectorize
+__global__
+void byte_to_half(byte *b, half *h)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	h[i*N+j] = __float2half(((float)(b[i*N+j])) / 255.f);
+}
+
+__global__
+void normalize_by(half *h, float n)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	h[i*N+j] = __hmul(h[i*N+j], __float2half(1.f / n));
+}
+
+__global__
+void half_to_float(half *h, float *f)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	f[i*N+j] = __half2float(h[i*N+j]);
+}
+
+// TODO: put all these casting kernels in a header
+__global__
+void half2_to_complex(half2 *h, cufftComplex *z)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	z[i*N+j] = __half22float2(h[i*N+j]);
+}
+
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
@@ -194,58 +256,85 @@ int main(int argc, char* argv[])
 
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
-	size_t buffer_size = NUM_SLICES*N*N*sizeof(half2);
 
-	half2 *image;
-	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(half2)) );
-	half2 *psf;
-	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(half2)) );
 	// allocate this on the host - that way CPU can manage transfer, not GPU, lets it run in async
 	// (this is 3x slower on Titan, but faster on Tegra - recall that host and GPU memory are the same thing in Tegra)
 	half2 *host_psf;
-	checkCudaErrors( cudaMallocHost((void **)&host_psf, buffer_size) );
+	checkCudaErrors( cudaMallocHost((void **)&host_psf, NUM_SLICES*N*(N/2+1)*sizeof(half2)) );
 
-	byte *image_u8;
-	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
+	half *img;
+	checkCudaErrors( cudaMalloc((void **)&img, N*N*sizeof(half)) );
+
+	half2 *img_f;
+	checkCudaErrors( cudaMalloc((void **)&img_f, N*(N/2+1)*sizeof(half2)) );
+
+	byte *img_u8;
+	checkCudaErrors( cudaMalloc((void **)&img_u8, N*N*sizeof(byte)) );
 
 	cudaStream_t math_stream, copy_stream;
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
-	half2 *buffers[2];
-	checkCudaErrors( cudaMalloc((void **)&buffers[0], buffer_size) );
-	checkCudaErrors( cudaMalloc((void **)&buffers[1], buffer_size) );
+	// inefficient! figure out reuse!!!
+	half2 *in_buffers[2];
+	checkCudaErrors( cudaMalloc((void **)&in_buffers[0], NUM_SLICES*N*(N/2+1)*sizeof(half2)) );
+	checkCudaErrors( cudaMalloc((void **)&in_buffers[1], NUM_SLICES*N*(N/2+1)*sizeof(half2)) );
+	half *out_buffers[2];
+	checkCudaErrors( cudaMalloc((void **)&out_buffers[0], NUM_SLICES*N*N*sizeof(half)) );
+	checkCudaErrors( cudaMalloc((void **)&out_buffers[1], NUM_SLICES*N*N*sizeof(half)) );
 
-	half *modulus;
-	checkCudaErrors( cudaMalloc((void **)&modulus, buffer_size / 2) );
-
-	cufftHandle fft_plan;
-	checkCudaErrors( cufftCreate(&fft_plan) );
-	checkCudaErrors( cufftXtMakePlanMany( \
-			fft_plan, 2, dims, \
-			NULL, 1, 0, CUDA_C_16F, \
+	cufftHandle plan_r2c;
+	cufftCreate(&plan_r2c);
+	checkCudaErrors( cufftXtMakePlanMany(plan_r2c, 2, dims, \
+			NULL, 1, 0, CUDA_R_16F, \
 			NULL, 1, 0, CUDA_C_16F, \
 			1, &work_sizes, CUDA_C_16F) );
-	checkCudaErrors( cufftSetStream(fft_plan, math_stream) );
+	checkCudaErrors( cufftSetStream(plan_r2c, math_stream) );
+
+	cufftHandle plan_c2r;
+	cufftCreate(&plan_c2r);
+	checkCudaErrors( cufftXtMakePlanMany(plan_c2r, 2, dims, \
+			NULL, 1, 0, CUDA_C_16F, \
+			NULL, 1, 0, CUDA_R_16F, \
+			1, &work_sizes, CUDA_C_16F) );
+	checkCudaErrors( cufftSetStream(plan_c2r, math_stream) );
+
+	// free these after setting up PSF
+	half *psf_re, *psf_im;
+	checkCudaErrors( cudaMalloc((void **)&psf_re, N*N*sizeof(half)) );
+	checkCudaErrors( cudaMalloc((void **)&psf_im, N*N*sizeof(half)) );
+	half2 *psf_re_f, *psf_im_f;
+	checkCudaErrors( cudaMalloc((void **)&psf_re_f, N*(N/2+1)*sizeof(half2)) );
+	checkCudaErrors( cudaMalloc((void **)&psf_im_f, N*(N/2+1)*sizeof(half2)) );
+	half2 *psf_f;
+	checkCudaErrors( cudaMalloc((void **)&psf_f, N*(N/2+1)*sizeof(half2)) );
 
 	// cache the PSF host-side
 	// this causes problems for Titan (separate memory), but ~10% speedup for Tegra
 	for (int slice = 0; slice < NUM_SLICES; slice++)
 	{
+		// TODO: do FFTs, merge, FFT-shift in float, only convert to half at end
+
 		float z = z_min + z_step * slice;
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
 		// ... which is no longer necessary because it's only generated once
-		construct_psf<<<N/2, N/2, 0, math_stream>>>(z, psf, -2.f * z / LAMBDA0 / N);
+		construct_psf<<<N/2, N/2, 0, math_stream>>>(z, psf_re, psf_im, -2.f * z / LAMBDA0 / N);
 
-		// FFT in-place
-		checkCudaErrors( cufftXtExec(fft_plan, psf, psf, CUFFT_FORWARD) );
+		// FFT the real and imaginary halves separately
+		// PSF not real-valued but it is symmetric, so the C2R transform still works!
+		checkCudaErrors( cufftXtExec(plan_r2c, psf_re, psf_re_f, CUFFT_FORWARD) );
+		checkCudaErrors( cufftXtExec(plan_r2c, psf_im, psf_im_f, CUFFT_FORWARD) );
+
+		// join the real and imaginary halves, yielding an Nx(N/2+1) filter matrix
+		merge_filter_halves<<<N/2+1, N>>>(psf_re_f, psf_im_f, psf_f);
 
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift (i.e. copy) later
-		frequency_shift<<<N, N, 0, math_stream>>>(psf);
+//		frequency_shift<<<N, N, 0, math_stream>>>(psf); // disabled until I figure this out for R2C/C2R
 
-		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(half2), cudaMemcpyDeviceToHost, math_stream) );
+		checkCudaErrors( cudaMemcpyAsync(host_psf + N*(N/2+1)*slice, psf_f, N*(N/2+1)*sizeof(half2), \
+				cudaMemcpyDeviceToHost, math_stream) );
 	}
 
 	// this would be a copy from a frame buffer on the Tegra
@@ -254,40 +343,50 @@ int main(int argc, char* argv[])
 	volatile bool frameReady = true; // this would be updated by the camera
 
 	// initialize the buffer for the first frame
-	checkCudaErrors( cudaMemcpyAsync(buffers[0], host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
+	checkCudaErrors( cudaMemcpyAsync(in_buffers[0], host_psf, NUM_SLICES*N*(N/2+1)*sizeof(half2), \
+			cudaMemcpyHostToDevice, copy_stream) );
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
-		half2 *buffer = buffers[frame % 2];
+		half2 *in_buffer = in_buffers[frame % 2];
+		half *out_buffer = out_buffers[frame % 2];
 
 		// wait for a frame...
 		while (!frameReady) { ; }
 		// ... and copy
-		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, math_stream) );
+		checkCudaErrors( cudaMemcpyAsync(img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, math_stream) );
 
 		// start copying the PSF for the next frame
 		// this is on the host so the copy doesn't occupy GPU
 		checkCudaErrors( cudaStreamSynchronize(copy_stream) ); // wait for previous copy to finish if it hasn't
-		checkCudaErrors( cudaMemcpyAsync(buffers[(frame + 1) % 2], host_psf, buffer_size, cudaMemcpyHostToDevice, copy_stream) );
+		checkCudaErrors( cudaMemcpyAsync(in_buffers[(frame + 1) % 2], host_psf, NUM_SLICES*N*(N/2+1)*sizeof(half2), \
+				cudaMemcpyHostToDevice, copy_stream) );
 
-		// up-cast to complex
-		byte_to_half2<<<N, N, 0, math_stream>>>(image_u8, image);
-		normalize_by<<<N, N, 0, math_stream>>>(image, N);
+		// convert to half... i think there's an intrinsic for this
+		byte_to_half<<<N, N, 0, math_stream>>>(img_u8, img);
+		// inefficient!
+		normalize_by<<<N, N, 0, math_stream>>>(img, N);
 
-		// FFT the image in-place
-		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
-		normalize_by<<<N, N, 0, math_stream>>>(image, N);
+		// FFT the image
+		checkCudaErrors( cufftXtExec(plan_r2c, img, img_f, CUFFT_FORWARD) );
+
+		normalize_by<<<N/2+1, N, 0, math_stream>>>(img_f, N);
 
 		// batch-multiply with FFT'ed image
-		batch_multiply<<<N, N, 0, math_stream>>>(buffer, image);
+		batch_multiply<<<N/2+1, N, 0, math_stream>>>(in_buffer, img_f);
 
 		// inverse FFT that product; cuFFT batching gave no speedup whatsoever and this permits plan reuse
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			checkCudaErrors( cufftXtExec(fft_plan, buffer + N*N*slice, buffer + N*N*slice, CUFFT_INVERSE) );
-		}
+//			float2 *img_c32;
+//			checkCudaErrors( cudaMalloc((void **)&img_c32, N*(N/2+1)*sizeof(float2)) );
+//			half2_to_complex<<<N/2+1, N>>>(in_buffer + N*(N/2+1)*slice, img_c32);
+//			imshow(cv::gpu::GpuMat(N, N/2+1, CV_32FC2, img_c32), true);
 
-		batch_modulus<<<N, N/2, 0, math_stream>>>(buffer, modulus);
+			checkCudaErrors( cufftXtExec(plan_c2r, in_buffer + N*(N/2+1)*slice, out_buffer + N*N*slice, CUFFT_INVERSE) );
+			// could now immediately start async populating the in_buffer, since this is out-of-place and iterative
+			// (i.e. might not need to double buffer after all)
+		}
 
 		// start timer after first run, GPU "warmup"
 		if (frame == 0)
@@ -298,21 +397,21 @@ int main(int argc, char* argv[])
 
 	std::cout << cudaTimerStop() / (num_frames - 1) << "ms" << std::endl;
 
-	checkCudaErrors( cudaFree(image) );
-	checkCudaErrors( cudaFree(psf) );
-	checkCudaErrors( cudaFreeHost(host_psf) );
-
-	checkCudaErrors( cufftDestroy(fft_plan) );
-	checkCudaErrors( cudaStreamDestroy(math_stream) );
-	checkCudaErrors( cudaStreamDestroy(copy_stream) );
-
-	checkCudaErrors( cudaFree(buffers[0]) );
-	checkCudaErrors( cudaFree(buffers[1]) );
-
+//	checkCudaErrors( cudaFree(image) );
+//	checkCudaErrors( cudaFree(psf) );
+//	checkCudaErrors( cudaFreeHost(host_psf) );
+//
+//	checkCudaErrors( cufftDestroy(fft_plan) );
+//	checkCudaErrors( cudaStreamDestroy(math_stream) );
+//	checkCudaErrors( cudaStreamDestroy(copy_stream) );
+//
+//	checkCudaErrors( cudaFree(buffers[0]) );
+//	checkCudaErrors( cudaFree(buffers[1]) );
+//
 	half_float::half *host_buffer;
-	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
-
-	checkCudaErrors( cudaMemcpy(host_buffer, modulus, NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
+	checkCudaErrors( cudaMallocHost((void **)&host_buffer, NUM_SLICES*N*N*sizeof(half_float::half)) );
+//
+	checkCudaErrors( cudaMemcpy(host_buffer, out_buffers[0], NUM_SLICES*N*N*sizeof(half), cudaMemcpyDeviceToHost) );
 
 	if (argc == 2)
 	{
