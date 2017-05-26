@@ -107,7 +107,7 @@ void imshow(cv::gpu::GpuMat in)
 //	g[ii*N+jj] = g_ij;
 //}
 __global__
-void construct_psf(float z, float *g_re, float *g_im, float norm)
+void construct_psf(float z, half *g_re, half *g_im, float norm)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
@@ -136,8 +136,8 @@ void construct_psf(float z, float *g_re, float *g_im, float norm)
 	g_ij.y = __fdividef(re, r);
 
 	// cast to half-precision
-	float g_ij_re = g_ij.x;
-	float g_ij_im = g_ij.y;
+	half g_ij_re = __float2half(g_ij.x);
+	half g_ij_im = __float2half(g_ij.y);
 
 	// I'm really skeptical about the memory access here - each seems around 2.5ms
 	// but when I tried shared memory it was slower
@@ -234,6 +234,15 @@ void half2_to_complex(half2 *h, cufftComplex *z)
 }
 
 __global__
+void normalize_by(half *h, float n)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	h[i*N+j] = __hmul(h[i*N+j], __float2half(1.f / n));
+}
+
+__global__
 void normalize_by(cufftComplex *z, float n)
 {
 	int i = blockIdx.x;
@@ -262,24 +271,35 @@ void complex_modulus(cufftComplex *z, float *r)
 }
 
 __global__
-void batch_multiply(float2 *z, float2 *w)
+void batch_multiply(half2 *z, const __restrict__ half2 *w)
 {
-	int i = blockIdx.x;
-	int j = threadIdx.x; // blockDim shall equal N
+	const int i = blockIdx.x;
+	const int j = threadIdx.x; // blockDim shall equal N
 
-	float2 a, b, c;
+	half2 w_ij = w[i*N+j];
+	half2 w_ij_inv = __lowhigh2highlow(w_ij);
 
-	a = z[i*N+j];
-	b = w[i*N+j];
+	half2 z_ij = z[i*N+j];
 
-	c.x = a.x * b.x - a.y * b.y;
-	c.y = a.x * b.y + a.y * b.x;
+	// z = a + ib, w = c + id
+	half2 ac_bd = __hmul2(z_ij, w_ij);
+	half re = __hsub(__low2half(ac_bd), __high2half(ac_bd));
 
-	z[i*N+j] = c;
+	half2 ad_bc = __hmul2(z_ij, w_ij_inv);
+	half im = __hadd(__low2half(ad_bc), __high2half(ad_bc));
+
+	// transpose
+//		half2 ac_ad = __highs2half2(ac_bd, __hneg2(ad_bc));
+//		half2 bd_bc = __lows2half2(ac_bd, ad_bc);
+
+	z[i*N+j] = __halves2half2(re, im);
+//		z[i*N+j] = __hadd2(ac_ad, bd_bc);
+
+	z += N*N;
 }
 
 __global__
-void merge_filter_halves(float2 *x_f, float2 *y_f, float2 *z_f)
+void merge_filter_halves(half2 *x_f, half2 *y_f, half2 *z_f)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
@@ -288,13 +308,12 @@ void merge_filter_halves(float2 *x_f, float2 *y_f, float2 *z_f)
 	// re(z) = re(x+iy) = re(a+ib+ic-d) = a-d
 	// im(z) = im(x+iy) = im(a+ib+ic-d) = b+c
 
-	float a = x_f[i*N+j].x;
-	float b = x_f[i*N+j].y;
-	float c = y_f[i*N+j].x;
-	float d = y_f[i*N+j].y;
+	half a = __low2half(x_f[i*N+j]);
+	half b = __high2half(x_f[i*N+j]);
+	half c = __low2half(y_f[i*N+j]);
+	half d = __high2half(y_f[i*N+j]);
 
-	z_f[i*N+j].x = a-d;
-	z_f[i*N+j].y = b+c;
+	z_f[i*N+j] = __halves2half2(__hsub(a, d), __hadd(b, c));
 }
 
 __global__
@@ -306,6 +325,24 @@ void byte_to_float(byte *b, float *z)
 	z[i*N+j] = ((float)(b[i*N+j])) / 255.f;
 }
 
+__global__
+void half_to_float(half *h, float *f)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	f[i*N+j] = __half2float(f[i*N+j]);
+}
+
+__global__
+void byte_to_half(byte *b, half *z)
+{
+	int i = blockIdx.x;
+	int j = threadIdx.x; // blockDim shall equal N
+
+	z[i*N+j] = __float2half(((float)(b[i*N+j])) / 255.f);
+}
+
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
@@ -313,8 +350,8 @@ int main(int argc, char* argv[])
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
 
-	float *img;
-	checkCudaErrors( cudaMalloc((void **)&img, N*N*sizeof(float)) );
+	half *img;
+	checkCudaErrors( cudaMalloc((void **)&img, N*N*sizeof(half)) );
 
 	byte *img_u8;
 	checkCudaErrors( cudaMalloc((void **)&img_u8, N*N*sizeof(byte)) );
@@ -323,17 +360,19 @@ int main(int argc, char* argv[])
 
 	checkCudaErrors( cudaMemcpy(img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
 
-	byte_to_float<<<N, N>>>(img_u8, img);
+	byte_to_half<<<N, N>>>(img_u8, img);
+	normalize_by<<<N/2, N>>>((half2 *)img, N);
 
-	float2 *img_f;
-	checkCudaErrors( cudaMalloc((void **)&img_f, N*(N/2+1)*sizeof(float2)) );
+	half2 *img_f;
+	checkCudaErrors( cudaMalloc((void **)&img_f, N*(N/2+1)*sizeof(half2)) );
+	normalize_by<<<N/2+1, N>>>(img_f, N);
 
 	cufftHandle plan_r2c;
 	cufftCreate(&plan_r2c);
 	checkCudaErrors( cufftXtMakePlanMany(plan_r2c, 2, dims, \
-			NULL, 1, 0, CUDA_R_32F, \
-			NULL, 1, 0, CUDA_C_32F, \
-			1, &work_sizes, CUDA_C_32F) );
+			NULL, 1, 0, CUDA_R_16F, \
+			NULL, 1, 0, CUDA_C_16F, \
+			1, &work_sizes, CUDA_C_16F) );
 	checkCudaErrors( cufftXtExec(plan_r2c, img, img_f, CUFFT_FORWARD) );
 
 	// one problem - this trick breaks, not sure how to fix...
@@ -341,22 +380,22 @@ int main(int argc, char* argv[])
 	// the Fourier ID is so slick though...
 //	invert_phase<<<N/2+1, N>>>(img_f);
 
-	float *psf_re, *psf_im;
-	checkCudaErrors( cudaMalloc((void **)&psf_re, N*N*sizeof(float)) );
-	checkCudaErrors( cudaMalloc((void **)&psf_im, N*N*sizeof(float)) );
+	half *psf_re, *psf_im;
+	checkCudaErrors( cudaMalloc((void **)&psf_re, N*N*sizeof(half)) );
+	checkCudaErrors( cudaMalloc((void **)&psf_im, N*N*sizeof(half)) );
 
 	float z = 50;
 	construct_psf<<<N/2, N/2>>>(z, psf_re, psf_im, -2.f * z / LAMBDA0 / N);
 
-	float2 *psf_re_f, *psf_im_f;
-	checkCudaErrors( cudaMalloc((void **)&psf_re_f, N*(N/2+1)*sizeof(float2)) );
-	checkCudaErrors( cudaMalloc((void **)&psf_im_f, N*(N/2+1)*sizeof(float2)) );
+	half2 *psf_re_f, *psf_im_f;
+	checkCudaErrors( cudaMalloc((void **)&psf_re_f, N*(N/2+1)*sizeof(half2)) );
+	checkCudaErrors( cudaMalloc((void **)&psf_im_f, N*(N/2+1)*sizeof(half2)) );
 
 	checkCudaErrors( cufftXtExec(plan_r2c, psf_re, psf_re_f, CUFFT_FORWARD) );
 	checkCudaErrors( cufftXtExec(plan_r2c, psf_im, psf_im_f, CUFFT_FORWARD) );
 
-	float2 *psf_f;
-	checkCudaErrors( cudaMalloc((void **)&psf_f, N*(N/2+1)*sizeof(float2)) );
+	half2 *psf_f;
+	checkCudaErrors( cudaMalloc((void **)&psf_f, N*(N/2+1)*sizeof(half2)) );
 
 	// kinda weird allocation, think of how to deal with
 	merge_filter_halves<<<N/2+1, N>>>(psf_re_f, psf_im_f, psf_f);
@@ -366,12 +405,17 @@ int main(int argc, char* argv[])
 	cufftHandle plan_c2r;
 	cufftCreate(&plan_c2r);
 	checkCudaErrors( cufftXtMakePlanMany(plan_c2r, 2, dims, \
-			NULL, 1, 0, CUDA_C_32F, \
-			NULL, 1, 0, CUDA_R_32F, \
-			1, &work_sizes, CUDA_C_32F) );
+			NULL, 1, 0, CUDA_C_16F, \
+			NULL, 1, 0, CUDA_R_16F, \
+			1, &work_sizes, CUDA_C_16F) );
 	checkCudaErrors( cufftXtExec(plan_c2r, img_f, img, CUFFT_INVERSE) );
 
-	imshow(cv::gpu::GpuMat(N, N, CV_32FC1, img));
+	float *img_f32;
+	checkCudaErrors( cudaMalloc((void **)&img_f32, N*N*sizeof(float)) );
+
+	half_to_float<<<N, N>>>(img, img_f32);
+
+	imshow(cv::gpu::GpuMat(N, N, CV_32FC1, img_f32));
 
 //
 ////	frequency_shift<<<N, N>>>(d_img_f16);
