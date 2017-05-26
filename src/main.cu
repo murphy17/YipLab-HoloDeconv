@@ -331,16 +331,16 @@ void half_to_float(half *h, float *f)
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
-	f[i*N+j] = __half2float(f[i*N+j]);
+	f[i*N+j] = __half2float(h[i*N+j]);
 }
 
 __global__
-void byte_to_half(byte *b, half *z)
+void byte_to_half(byte *b, half *h)
 {
 	int i = blockIdx.x;
 	int j = threadIdx.x; // blockDim shall equal N
 
-	z[i*N+j] = __float2half(((float)(b[i*N+j])) / 255.f);
+	h[i*N+j] = __float2half(((float)(b[i*N+j])) / 255.f);
 }
 
 int main(int argc, char* argv[])
@@ -356,12 +356,15 @@ int main(int argc, char* argv[])
 	byte *img_u8;
 	checkCudaErrors( cudaMalloc((void **)&img_u8, N*N*sizeof(byte)) );
 
+	float *img_f32;
+	checkCudaErrors( cudaMalloc((void **)&img_f32, N*N*sizeof(float)) );
+
 	cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
 
 	checkCudaErrors( cudaMemcpy(img_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice) );
 
 	byte_to_half<<<N, N>>>(img_u8, img);
-	normalize_by<<<N/2, N>>>((half2 *)img, N);
+	normalize_by<<<N, N>>>(img, N); // cast to half2, use half the threads
 
 	half2 *img_f;
 	checkCudaErrors( cudaMalloc((void **)&img_f, N*(N/2+1)*sizeof(half2)) );
@@ -409,9 +412,6 @@ int main(int argc, char* argv[])
 			NULL, 1, 0, CUDA_R_16F, \
 			1, &work_sizes, CUDA_C_16F) );
 	checkCudaErrors( cufftXtExec(plan_c2r, img_f, img, CUFFT_INVERSE) );
-
-	float *img_f32;
-	checkCudaErrors( cudaMalloc((void **)&img_f32, N*N*sizeof(float)) );
 
 	half_to_float<<<N, N>>>(img, img_f32);
 
