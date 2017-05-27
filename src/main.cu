@@ -35,9 +35,15 @@ typedef unsigned char byte;
 void imshow(cv::Mat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
-	cv::Mat out;
+	cv::Mat out = in;
 	cudaDeviceSynchronize();
-	in.convertTo(out, CV_32FC1);
+	if (out.channels() == 2)
+	{
+		cv::Mat channels[2];
+		cv::split(out, channels);
+		cv::magnitude(channels[0], channels[1], out);
+	}
+	out.convertTo(out, CV_32FC1);
 	cv::normalize(out, out, 1.0, 0.0, cv::NORM_MINMAX, -1);
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
@@ -211,7 +217,7 @@ int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 3;
+	int num_frames = 5;
 	float z_min = 30;
 	float z_step = 1;
 	int num_streams = 1;
@@ -222,18 +228,19 @@ int main(int argc, char* argv[])
 
 	cufftComplex *image;
 	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(cufftComplex)) );
-	cufftComplex *psf;
-	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(cufftComplex)) );
+//	cufftComplex *psf;
+//	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(cufftComplex)) );
 	// allocate this on the host - that way CPU can manage transfer, not GPU, lets it run in async
 	// (this is 3x slower on Titan, but faster on Tegra - recall that host and GPU memory are the same thing in Tegra)
 	cufftComplex *host_psf;
-	checkCudaErrors( cudaMallocHost((void **)&host_psf, buffer_size) );
+	checkCudaErrors( cudaMallocHost((void **)&host_psf, NUM_SLICES*(N/2+1)*(N/2+1)*sizeof(cufftComplex)) );
 
 	byte *image_u8;
 	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
 
 	cudaStream_t streams[num_streams];
-	cufftComplex *stream_buffers[num_streams];
+//	cufftComplex *stream_buffers[num_streams];
+	cudaPitchedPtr stream_buffers[num_streams];
 	cufftHandle fft_plans[num_streams];
 
 	// TODO: investigate properly batched FFTs
@@ -248,8 +255,15 @@ int main(int argc, char* argv[])
 				NULL, 1, 0, CUDA_C_32F, \
 				1, &work_sizes, CUDA_C_32F) );
 		checkCudaErrors( cufftSetStream(fft_plans[i], streams[i]) );
-		checkCudaErrors( cudaMalloc((void **)&stream_buffers[i], buffer_size) );
+		checkCudaErrors( cudaMalloc3D(&stream_buffers[i], make_cudaExtent(N * sizeof(cufftComplex), N, NUM_SLICES)) );
+//		checkCudaErrors( cudaMalloc((void **)&stream_buffers[i], buffer_size) );
 	}
+
+	float *modulus;
+	checkCudaErrors( cudaMalloc((void **)&modulus, NUM_SLICES*N*N*sizeof(float)) );
+
+	cufftComplex *psf;
+	checkCudaErrors( cudaMalloc ((void **)&psf, N*N*sizeof(cufftComplex)) );
 
 	// cache the PSF; with a Titan or 8GB TX2 this shouldn't be an issue
 	// note this allows async copying for next frame... (I think? are self-copies DMA?)
@@ -257,47 +271,101 @@ int main(int argc, char* argv[])
 	{
 		float z = z_min + z_step * slice;
 
-		checkCudaErrors( cudaMemset(psf, 0, N*N*sizeof(cufftComplex)) );
+		checkCudaErrors( cudaMemset(psf, 0, N*N*sizeof(cufftComplex)) ); // make sure works fine without this
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
-		construct_psf<<<N/2+1, N/2+1, 0, streams[0]>>>(z, psf, -2.f * z / LAMBDA0);
+		construct_psf<<<N/2+1, N/2+1>>>(z, psf, -2.f * z / LAMBDA0);
 
 		// testing symmetry
-		mirror_quadrants<<<N/2+1, N/2+1, 0, streams[0]>>>(psf);
+		mirror_quadrants<<<N/2+1, N/2+1>>>(psf);
 
 		// FFT in-place
 		checkCudaErrors( cufftXtExec(fft_plans[0], psf, psf, CUFFT_FORWARD) );
+		checkCudaErrors( cudaStreamSynchronize(streams[0]) );
 
 		// testing symmetry
-		mirror_quadrants<<<N/2+1, N/2+1, 0, streams[0]>>>(psf);
+		// mirror_quadrants<<<N/2+1, N/2+1, 0, streams[0]>>>(psf);
 
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
-		frequency_shift<<<N, N, 0, streams[0]>>>(psf);
+		frequency_shift<<<N, N>>>(psf);
 
-		// TODO: only store (N/2+1)^2 entries
-		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(cufftComplex), cudaMemcpyDeviceToHost, streams[0]) );
+//		checkCudaErrors( cudaMemcpy(host_psf + (N/2+1)*(N/2+1)*slice, psf, (N/2+1)*(N/2+1)*sizeof(cufftComplex), \
+//				cudaMemcpyDeviceToHost) );
+
+		checkCudaErrors( cudaMemcpy2D( \
+				host_psf + (N/2+1)*(N/2+1)*slice, \
+				(N/2+1)*sizeof(cufftComplex), \
+				psf, \
+				N*sizeof(cufftComplex), \
+				(N/2+1)*sizeof(cufftComplex), \
+				N/2+1, \
+				cudaMemcpyDeviceToHost \
+				) );
 	}
 
-	// this would be a copy from a frame buffer on the Tegra
-	cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
+	for (int slice = 0; slice < NUM_SLICES; slice++)
+	{
+		imshow(cv::Mat(N/2+1, N/2+1, CV_32FC2, host_psf + (N/2+1)*(N/2+1)*slice));
+	}
 
 	volatile bool frameReady = true; // this would be updated by the camera
+
+
+	// TODO: cudaMemcpyAsync3D - necessary since only storing a quarter of the PSF
+	cudaMemcpy3DParms p = { 0 };
+
+	p.srcPtr.ptr = host_psf;
+	p.srcPtr.pitch = (N/2+1) * sizeof(cufftComplex);
+	p.srcPtr.xsize = (N/2+1);
+	p.srcPtr.ysize = (N/2+1);
+	p.dstPtr.ptr = stream_buffers[0].ptr;
+	p.dstPtr.pitch = stream_buffers[0].pitch;
+	p.dstPtr.xsize = N;
+	p.dstPtr.ysize = N;
+	p.extent.width = (N/2+1) * sizeof(cufftComplex);
+	p.extent.height = (N/2+1);
+	p.extent.depth = NUM_SLICES;
+	p.kind = cudaMemcpyHostToDevice;
+
+	checkCudaErrors( cudaMemcpy3D(&p) );
+
+	for (int i = 0; i < NUM_SLICES; i++) imshow(cv::cuda::GpuMat(N, N, CV_32FC2, ((cufftComplex *)stream_buffers[0].ptr) + N*N*i));
+
+	return 0;
+
+	/*
+	// this would be a copy from a frame buffer on the Tegra
+	cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
 		int stream_num = frame % num_streams;
 		cudaStream_t stream = streams[stream_num];
-		cufftComplex *buffer = stream_buffers[stream_num];
+		cufftComplex *buffer = (cufftComplex *)stream_buffers[stream_num].ptr;
 
 		// wait for a frame...
 		while (!frameReady) { ; }
 		// ... and copy
 		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, stream) );
 
-		// this is on the host so the copy doesn't occupy GPU
-		// because the call is non-blocking, it means PSF copy for *next* frame gets cued up immediately
-		checkCudaErrors( cudaMemcpyAsync(buffer, host_psf, buffer_size, cudaMemcpyHostToDevice, stream) );
+		// TODO: cudaMemcpyAsync3D - necessary since only storing a quarter of the PSF
+		cudaMemcpy3DParms p = { 0 };
+
+		p.srcPtr.ptr = host_psf;
+		p.srcPtr.pitch = (N/2+1) * sizeof(cufftComplex);
+		p.srcPtr.xsize = (N/2+1);
+		p.srcPtr.ysize = (N/2+1);
+		p.dstPtr.ptr = stream_buffers[stream_num].ptr;
+		p.dstPtr.pitch = stream_buffers[stream_num].pitch;
+		p.dstPtr.xsize = N;
+		p.dstPtr.ysize = N;
+		p.extent.width = (N/2+1) * sizeof(cufftComplex);
+		p.extent.height = (N/2+1);
+		p.extent.depth = NUM_SLICES;
+		p.kind = cudaMemcpyHostToDevice;
+
+		checkCudaErrors( cudaMemcpy3DAsync(&p, stream) );
 
 		// up-cast to complex
 		byte_to_complex<<<N, N, 0, stream>>>(image_u8, image);
@@ -325,7 +393,10 @@ int main(int argc, char* argv[])
 		// TODO: reusing the first half of the buffer ... is this fine? not sure about that!!!
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			complex_modulus<<<N, N, 0, stream>>>(buffer + N*N*slice, (float *)buffer + N*N*slice);
+			if (frame == 0)
+				complex_modulus<<<N, N, 0, stream>>>(buffer + N*N*slice, modulus + N*N*slice);
+			else
+				complex_modulus<<<N, N, 0, stream>>>(buffer + N*N*slice, (float *)buffer + N*N*slice);
 		}
 
 		// start timer after first run, GPU "warmup"
@@ -340,20 +411,19 @@ int main(int argc, char* argv[])
 	float *host_buffer;
 	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
 
-	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], buffer_size, cudaMemcpyDeviceToHost) );
-
-	checkCudaErrors( cudaFree(stream_buffers[0]) );
+	checkCudaErrors( cudaMemcpy(host_buffer, modulus, NUM_SLICES*N*N*sizeof(float), cudaMemcpyDeviceToHost) );
 
 	if (argc == 2)
 	{
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
-			imshow(B);
+			imshow(cv::Mat(N, N, CV_32FC1, host_buffer + N*N*slice));
 		}
 	}
 
 	// TODO: reimplement cleanup code once satisfied with implementation
 
 	return 0;
+
+	*/
 }
