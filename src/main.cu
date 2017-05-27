@@ -299,7 +299,7 @@ int main(int argc, char* argv[])
 	{
 		float z = z_min + z_step * slice;
 
-		checkCudaErrors( cudaMemset(psf, 0, N*N*sizeof(cufftComplex)) ); // make sure works fine without this
+//		checkCudaErrors( cudaMemset(psf, 0, N*N*sizeof(cufftComplex)) ); // make sure works fine without this
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
 		construct_psf<<<N/2+1, N/2+1>>>(z, psf, -2.f * z / LAMBDA0);
@@ -322,21 +322,18 @@ int main(int argc, char* argv[])
 
 		// copy the upper-left submatrix
 		checkCudaErrors( cudaMemcpy2D( \
-				host_psf + (N/2+1)*(N/2+1)*slice, \
-				(N/2+1)*sizeof(cufftComplex), \
-				psf, \
-				N*sizeof(cufftComplex), \
-				(N/2+1)*sizeof(cufftComplex), \
-				N/2+1, \
+				host_psf + (N/2+1)*(N/2+1)*slice, (N/2+1)*sizeof(cufftComplex), \
+				psf, N*sizeof(cufftComplex), \
+				(N/2+1)*sizeof(cufftComplex), N/2+1, \
 				cudaMemcpyDeviceToHost \
 				) );
 	}
 
-	checkCudaErrors( cudaMemset(in_buffers[0], 0, NUM_SLICES*N*N*sizeof(cufftComplex)) ); // make sure works fine without this
-	checkCudaErrors( cudaMemset(in_buffers[1], 0, NUM_SLICES*N*N*sizeof(cufftComplex)) ); // make sure works fine without this
+//	checkCudaErrors( cudaMemset(in_buffers[0], 0, NUM_SLICES*N*N*sizeof(cufftComplex)) ); // make sure works fine without this
+//	checkCudaErrors( cudaMemset(in_buffers[1], 0, NUM_SLICES*N*N*sizeof(cufftComplex)) ); // make sure works fine without this
 
 	// I only think one out buffer is needed
-	checkCudaErrors( cudaMemset(out_buffer, 0, NUM_SLICES*N*N*sizeof(float)) ); // make sure works fine without this
+//	checkCudaErrors( cudaMemset(out_buffer, 0, NUM_SLICES*N*N*sizeof(float)) ); // make sure works fine without this
 //	checkCudaErrors( cudaMemset(out_buffers[0], 0, NUM_SLICES*N*N*sizeof(float)) ); // make sure works fine without this
 //	checkCudaErrors( cudaMemset(out_buffers[1], 0, NUM_SLICES*N*N*sizeof(float)) ); // make sure works fine without this
 
