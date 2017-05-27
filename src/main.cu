@@ -352,16 +352,16 @@ int main(int argc, char* argv[])
 	for (int frame = 0; frame < num_frames; frame++)
 	{
 		cufftComplex *in_buffer = in_buffers[frame % 2];
-//		float *out_buffer = out_buffers[frame % 2];
 
 		// wait for a frame...
 		while (!frameReady) { ; }
 		// ... and copy
-		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, copy_stream) );
+		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, math_stream) );
 
 		// queue transfer for next frame, waiting for it to finish if necessary(?)
 		checkCudaErrors( cudaStreamSynchronize(math_stream) );
-		checkCudaErrors( transfer_psf(host_psf, in_buffers[(frame + 1) % 2], math_stream) );
+		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
+		checkCudaErrors( transfer_psf(host_psf, in_buffers[(frame + 1) % 2], copy_stream) );
 
 		// up-cast to complex
 		byte_to_complex<<<N, N, 0, math_stream>>>(image_u8, image);
