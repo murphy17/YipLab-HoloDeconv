@@ -121,7 +121,7 @@ void frequency_shift(cufftComplex *data)
 	data[i*N+j].y *= a;
 }
 
-__device__
+__device__ __forceinline__
 cufftComplex _multiply_helper(cufftComplex a, cufftComplex b)
 {
 	cufftComplex c;
@@ -149,11 +149,9 @@ void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 	}
 }
 
-__global__
-void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+__device__
+void _quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w, int i, int j)
 {
-	const int i = blockIdx.x;
-	const int j = threadIdx.x;
 	const int ii = N-i;
 	const int jj = N-j;
 
@@ -215,50 +213,19 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 		}
 		break;
 	}
+}
 
-	/*
-	// catch the stragglers... this would permit nice block/thread sizes, if it worked
-	if (i==N/2-1)
-	{
-		w_[0] = w[(i+1)*N+j];
-		w_[1] = w[(i+1)*N+jj];
-		z_ = z;
-		for (int k = 0; k < NUM_SLICES; k++)
-		{
-			cufftComplex z_ij = z_[(i+1)*N+j];
-			z_[(i+1)*N+j] = _multiply_helper(w_[0], z_ij);
-			z_[(i+1)*N+jj] = _multiply_helper(w_[1], z_ij);
-			z_ += N*N;
-		}
-	}
+__global__
+void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+{
+	const int i = blockIdx.x;
+	const int j = threadIdx.x;
 
-	if (j==N/2-1)
-	{
-		w_[0] = w[i*N+(j+1)];
-		w_[2] = w[ii*N+(j+1)];
-		z_ = z;
-		for (int k = 0; k < NUM_SLICES; k++)
-		{
-			cufftComplex z_ij = z_[i*N+(j+1)];
-			z_[i*N+(j+1)] = _multiply_helper(w_[0], z_ij);
-			z_[ii*N+(j+1)] = _multiply_helper(w_[2], z_ij);
-			z_ += N*N;
-		}
-	}
-
-
-	if (i==N/2-1&&j==N/2-1)
-	{
-		w_[0] = w[(i+1)*N+(j+1)];
-		z_ = z;
-		for (int k = 0; k < NUM_SLICES; k++)
-		{
-			cufftComplex z_ij = z_[(i+1)*N+(j+1)];
-			z_[(i+1)*N+(j+1)] = _multiply_helper(w_[0], z_ij);
-			z_ += N*N;
-		}
-	}
-	*/
+	// permits using nicely-sized kernel dimensions
+	_quadrant_multiply(z, w, i, j);
+	if (i == N/2-1) _quadrant_multiply(z, w, i+1, j);
+	if (j == N/2-1) _quadrant_multiply(z, w, i, j+1);
+	if (i == N/2-1 && j == N/2-1) _quadrant_multiply(z, w, i+1, j+1);
 }
 
 __global__
@@ -456,7 +423,7 @@ int main(int argc, char* argv[])
 //		}
 
 		// batch-multiply with FFT'ed image
-		quadrant_multiply<<<N/2+1, N/2+1, 0, math_stream>>>(in_buffer, image);
+		quadrant_multiply<<<N/2, N/2, 0, math_stream>>>(in_buffer, image);
 
 		// inverse FFT that product
 		// TODO: doing the modulus in here as callback would be quite nice, would like to retry
