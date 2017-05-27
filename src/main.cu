@@ -220,7 +220,7 @@ int main(int argc, char* argv[])
 	int num_frames = 5;
 	float z_min = 30;
 	float z_step = 1;
-	int num_streams = 1;
+	int num_streams = 2;
 
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
@@ -239,8 +239,8 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
 
 	cudaStream_t streams[num_streams];
-//	cufftComplex *stream_buffers[num_streams];
-	cudaPitchedPtr stream_buffers[num_streams];
+	cufftComplex *stream_buffers[num_streams];
+//	cudaPitchedPtr stream_buffers[num_streams];
 	cufftHandle fft_plans[num_streams];
 
 	// TODO: investigate properly batched FFTs
@@ -255,8 +255,8 @@ int main(int argc, char* argv[])
 				NULL, 1, 0, CUDA_C_32F, \
 				1, &work_sizes, CUDA_C_32F) );
 		checkCudaErrors( cufftSetStream(fft_plans[i], streams[i]) );
-		checkCudaErrors( cudaMalloc3D(&stream_buffers[i], make_cudaExtent(N * sizeof(cufftComplex), N, NUM_SLICES)) );
-//		checkCudaErrors( cudaMalloc((void **)&stream_buffers[i], buffer_size) );
+//		checkCudaErrors( cudaMalloc3D(&stream_buffers[i], make_cudaExtent(N * sizeof(cufftComplex), N, NUM_SLICES)) );
+		checkCudaErrors( cudaMalloc((void **)&stream_buffers[i], buffer_size) );
 	}
 
 	float *modulus;
@@ -290,9 +290,9 @@ int main(int argc, char* argv[])
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N>>>(psf);
 
-//		checkCudaErrors( cudaMemcpy(host_psf + (N/2+1)*(N/2+1)*slice, psf, (N/2+1)*(N/2+1)*sizeof(cufftComplex), \
-//				cudaMemcpyDeviceToHost) );
+		// TODO: the PSF quadrants themselves are symmetric matrices...
 
+		// copy the upper-left submatrix
 		checkCudaErrors( cudaMemcpy2D( \
 				host_psf + (N/2+1)*(N/2+1)*slice, \
 				(N/2+1)*sizeof(cufftComplex), \
@@ -304,37 +304,30 @@ int main(int argc, char* argv[])
 				) );
 	}
 
-	for (int slice = 0; slice < NUM_SLICES; slice++)
-	{
-		imshow(cv::Mat(N/2+1, N/2+1, CV_32FC2, host_psf + (N/2+1)*(N/2+1)*slice));
-	}
+//	for (int slice = 0; slice < NUM_SLICES; slice++)
+//	{
+//		imshow(cv::Mat(N/2+1, N/2+1, CV_32FC2, host_psf + (N/2+1)*(N/2+1)*slice));
+//	}
 
 	volatile bool frameReady = true; // this would be updated by the camera
 
+//	cufftComplex *buffer;
+//	checkCudaErrors( cudaMalloc ((void **)&buffer, NUM_SLICES*N*N*sizeof(cufftComplex)) );
+//	checkCudaErrors( cudaMemset (buffer, 0, NUM_SLICES*N*N*sizeof(cufftComplex)) );
 
-	// TODO: cudaMemcpyAsync3D - necessary since only storing a quarter of the PSF
-	cudaMemcpy3DParms p = { 0 };
+//	for (int slice = 0; slice < NUM_SLICES; slice++)
+//	{
+//		checkCudaErrors( cudaMemcpy2D(buffer + N*N*slice, \
+//				N*sizeof(cufftComplex), \
+//				host_psf + (N/2+1)*(N/2+1)*slice, \
+//				(N/2+1)*sizeof(cufftComplex), \
+//				(N/2+1)*sizeof(cufftComplex), \
+//				N/2+1, \
+//				cudaMemcpyHostToDevice \
+//				) );
+//		imshow(cv::cuda::GpuMat(N, N, CV_32FC2, buffer + N*N*slice));
+//	}
 
-	p.srcPtr.ptr = host_psf;
-	p.srcPtr.pitch = (N/2+1) * sizeof(cufftComplex);
-	p.srcPtr.xsize = (N/2+1);
-	p.srcPtr.ysize = (N/2+1);
-	p.dstPtr.ptr = stream_buffers[0].ptr;
-	p.dstPtr.pitch = stream_buffers[0].pitch;
-	p.dstPtr.xsize = N;
-	p.dstPtr.ysize = N;
-	p.extent.width = (N/2+1) * sizeof(cufftComplex);
-	p.extent.height = (N/2+1);
-	p.extent.depth = NUM_SLICES;
-	p.kind = cudaMemcpyHostToDevice;
-
-	checkCudaErrors( cudaMemcpy3D(&p) );
-
-	for (int i = 0; i < NUM_SLICES; i++) imshow(cv::cuda::GpuMat(N, N, CV_32FC2, ((cufftComplex *)stream_buffers[0].ptr) + N*N*i));
-
-	return 0;
-
-	/*
 	// this would be a copy from a frame buffer on the Tegra
 	cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
 
@@ -342,7 +335,7 @@ int main(int argc, char* argv[])
 	{
 		int stream_num = frame % num_streams;
 		cudaStream_t stream = streams[stream_num];
-		cufftComplex *buffer = (cufftComplex *)stream_buffers[stream_num].ptr;
+		cufftComplex *buffer = stream_buffers[stream_num];
 
 		// wait for a frame...
 		while (!frameReady) { ; }
@@ -356,8 +349,8 @@ int main(int argc, char* argv[])
 		p.srcPtr.pitch = (N/2+1) * sizeof(cufftComplex);
 		p.srcPtr.xsize = (N/2+1);
 		p.srcPtr.ysize = (N/2+1);
-		p.dstPtr.ptr = stream_buffers[stream_num].ptr;
-		p.dstPtr.pitch = stream_buffers[stream_num].pitch;
+		p.dstPtr.ptr = buffer;
+		p.dstPtr.pitch = N * sizeof(cufftComplex);
 		p.dstPtr.xsize = N;
 		p.dstPtr.ysize = N;
 		p.extent.width = (N/2+1) * sizeof(cufftComplex);
@@ -424,6 +417,4 @@ int main(int argc, char* argv[])
 	// TODO: reimplement cleanup code once satisfied with implementation
 
 	return 0;
-
-	*/
 }
