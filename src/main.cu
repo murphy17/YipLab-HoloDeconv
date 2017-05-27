@@ -125,12 +125,11 @@ __device__
 cufftComplex _multiply_helper(cufftComplex a, cufftComplex b)
 {
 	cufftComplex c;
-	float a_temp = a.y;
-	float ay_by = __fmul_rn(a_temp, b.y);
-	float ay_bx = __fmul_rn(a_temp, b.x);
-	a_temp = a.x;
-	c.x = __fmaf_rn(a_temp, b.x, -ay_by);
-	c.y = __fmaf_rn(a_temp, b.y, ay_bx);
+
+	// with O3 on this is fine
+	c.x = a.x * b.x - a.y * b.y;
+	c.y = a.x * b.y + a.y * b.x;
+
 	return c;
 }
 
@@ -172,6 +171,7 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 	cufftComplex z_ij;
 
 	// conditional unwrapping
+	// this had no effect, but compiler didn't seem to be doing it?
 	switch (cond)
 	{
 		case 3:
