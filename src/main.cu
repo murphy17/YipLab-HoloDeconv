@@ -14,8 +14,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-#include <opencv2/gpu/gpu.hpp>
-//#include <opencv2/core/cuda.hpp>
+//#include <opencv2/gpu/gpu.hpp>
+#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -25,11 +25,9 @@
 #define N 1024
 #define LOG2N 10
 #define DX (5.32f / 1024.f)
-#define DY (6.66f / 1280.f)
+#define DY (5.32f / 1024.f) // (6.66f / 1280.f) ... are these supposed to be the *SAME*? very close, but exact same helps a lot!
 #define LAMBDA0 0.000488f
-#define SCALE 0.00097751711f // 1/(N-1)
-#define NUM_SLICES 100 // 100
-#define MAX_BLOCK_THREADS 1024
+#define NUM_SLICES 100
 
 typedef unsigned char byte;
 
@@ -44,7 +42,7 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::gpu::GpuMat in)
+void imshow(cv::cuda::GpuMat in)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -71,12 +69,12 @@ void construct_psf(float z, cufftComplex *g, float norm)
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	const int ii = (N - 1) - i;
-	const int jj = (N - 1) - j;
+//	const int ii = (N - 1) - i;
+//	const int jj = (N - 1) - j;
 
-	// not sure whether the expansion of N/(N-1) was necessary
-	float x = (i * SCALE + i - N/2) * DX;
-	float y = (j * SCALE + j - N/2) * DY;
+	// 'FFT-even symmetry' - periodic extension must be symmetric about (0,0)
+	float x = (i - N/2) * DX;
+	float y = (j - N/2) * DY;
 
 	// could omit negation here, symmetries of trig functions take care of it
 	float r = (-2.f / LAMBDA0) * norm3df(x, y, z);
@@ -96,9 +94,9 @@ void construct_psf(float z, cufftComplex *g, float norm)
 
 	// CUDA takes care of coalescing the reversed access, this is fine
 	g[i*N+j] = g_ij;
-	g[i*N+jj] = g_ij;
-	g[ii*N+j] = g_ij;
-	g[ii*N+jj] = g_ij;
+//	g[i*N+jj] = g_ij;
+//	g[ii*N+j] = g_ij;
+//	g[ii*N+jj] = g_ij;
 }
 
 // exploit Fourier duality to shift without copying
@@ -115,28 +113,91 @@ void frequency_shift(cufftComplex *data)
 	data[i*N+j].y *= a;
 }
 
+__device__
+cufftComplex _multiply_helper(cufftComplex a, cufftComplex b)
+{
+	cufftComplex c;
+	float a_temp = a.y;
+	float ay_by = __fmul_rn(a_temp, b.y);
+	float ay_bx = __fmul_rn(a_temp, b.x);
+	a_temp = a.x;
+	c.x = __fmaf_rn(a_temp, b.x, -ay_by);
+	c.y = __fmaf_rn(a_temp, b.y, ay_bx);
+	return c;
+}
+
 __global__
 void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
 
-	cufftComplex b = w[i*N+j];
-	float bx = b.x; float by = b.y; // just making sure
+	cufftComplex w_ij = w[i*N+j];
 
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
-		cufftComplex a = z[i*N+j];
-
-		float a_temp = a.y;
-		float ay_by = __fmul_rn(a_temp, by);
-		float ay_bx = __fmul_rn(a_temp, bx);
-		a_temp = a.x;
-		z[i*N+j].x = __fmaf_rn(a_temp, bx, -ay_by);
-		z[i*N+j].y = __fmaf_rn(a_temp, by, ay_bx);
+		z[i*N+j] = _multiply_helper(z[i*N+j], w_ij);
 
 		z += N*N;
 	}
+}
+
+__global__
+void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+{
+	const int i = blockIdx.x;
+	const int j = threadIdx.x;
+	const int ii = N-i;
+	const int jj = N-j;
+
+	cufftComplex w_ = w[i*N+j];
+	cufftComplex *z_ = z;
+
+	// once this is working move those conditionals outside the loop
+	// unless compiler is doing that already... no, it's not
+
+	if (i>0&&i<N/2&&j>0&&j<N/2)
+	{
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_[ii*N+jj] = _multiply_helper(z_[ii*N+jj], w_);
+			z_ += N*N;
+		}
+	}
+	if (i>0&&i<N/2)
+	{
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_[ii*N+j] = _multiply_helper(z_[ii*N+j], w_);
+			z_ += N*N;
+		}
+	}
+	if (j>0&&j<N/2)
+	{
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_[i*N+jj] = _multiply_helper(z_[i*N+jj], w_);
+			z_ += N*N;
+		}
+	}
+	for (int k = 0; k < NUM_SLICES; k++)
+	{
+		z_[i*N+j] = _multiply_helper(z_[i*N+j], w_);
+		z_ += N*N;
+	}
+}
+
+__global__
+void mirror_quadrants(cufftComplex *z)
+{
+	const int i = blockIdx.x;
+	const int j = threadIdx.x;
+	const int ii = N-i;
+	const int jj = N-j;
+
+	if (j>0&&j<N/2) z[i*N+jj] = z[i*N+j];
+	if (i>0&&i<N/2) z[ii*N+j] = z[i*N+j];
+	if (i>0&&i<N/2&&j>0&&j<N/2) z[ii*N+jj] = z[i*N+j];
 }
 
 __global__
@@ -196,10 +257,6 @@ int main(int argc, char* argv[])
 	cufftComplex *stream_buffers[num_streams];
 	cufftHandle fft_plans[num_streams];
 
-	// setup multiply kernel
-	dim3 grid_dims(N*N / (MAX_BLOCK_THREADS / NUM_SLICES));
-	dim3 block_dims(MAX_BLOCK_THREADS / NUM_SLICES, NUM_SLICES);
-
 	// TODO: investigate properly batched FFTs
 	// (does space requirement increase? if so don't)
 	for (int i = 0; i < num_streams; i++)
@@ -221,16 +278,25 @@ int main(int argc, char* argv[])
 	{
 		float z = z_min + z_step * slice;
 
+		checkCudaErrors( cudaMemset(psf, 0, N*N*sizeof(cufftComplex)) );
+
 		// generate the PSF, weakly taking advantage of symmetry to speed up
-		construct_psf<<<N/2, N/2, 0, streams[0]>>>(z, psf, -2.f * z / LAMBDA0);
+		construct_psf<<<N/2+1, N/2+1, 0, streams[0]>>>(z, psf, -2.f * z / LAMBDA0);
+
+		// testing symmetry
+		mirror_quadrants<<<N/2+1, N/2+1, 0, streams[0]>>>(psf);
 
 		// FFT in-place
 		checkCudaErrors( cufftXtExec(fft_plans[0], psf, psf, CUFFT_FORWARD) );
+
+		// testing symmetry
+		mirror_quadrants<<<N/2+1, N/2+1, 0, streams[0]>>>(psf);
 
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N, N, 0, streams[0]>>>(psf);
 
+		// TODO: only store (N/2+1)^2 entries
 		checkCudaErrors( cudaMemcpyAsync(host_psf + N*N*slice, psf, N*N*sizeof(cufftComplex), cudaMemcpyDeviceToHost, streams[0]) );
 	}
 
@@ -260,9 +326,14 @@ int main(int argc, char* argv[])
 		// FFT the image in-place
 		checkCudaErrors( cufftExecC2C(fft_plans[stream_num], image, image, CUFFT_FORWARD) );
 
+		// random thought: an abstraction layer between kernel allocation and matrix dims would be nice
+		// will likely involve template method
+
 		// batch-multiply with FFT'ed image
-		batch_multiply<<<N, N, 0, stream>>>(buffer, image);
+		quadrant_multiply<<<N/2+1, N/2+1, 0, stream>>>(buffer, image);
 //		batch_multiply<<<grid_dims, block_dims, 0, stream>>>(buffer, image);
+
+		checkCudaErrors( cudaGetLastError() );
 
 		// inverse FFT that product
 		// TODO: doing the modulus in here as callback would be quite nice, would like to retry
@@ -279,9 +350,6 @@ int main(int argc, char* argv[])
 			complex_modulus<<<N, N, 0, stream>>>(buffer + N*N*slice, (float *)buffer + N*N*slice);
 		}
 
-		// checkCudaErrors( cudaStreamSynchronize(streams[(frame - 1) % num_streams]) ); // this would not be needed!
-		// checkCudaErrors( cudaMemcpyAsync(host_buffer, buffer, buffer_size, cudaMemcpyDeviceToHost, stream) ); // holy shit this is slow
-
 		// start timer after first run, GPU "warmup"
 		if (frame == 0)
 			cudaTimerStart();
@@ -291,38 +359,21 @@ int main(int argc, char* argv[])
 
 	std::cout << cudaTimerStop() / (num_frames - 1) << "ms" << std::endl;
 
-	// Tegra runs out of memory when I try to visualize...
+	float *host_buffer;
+	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
 
-//	checkCudaErrors( cudaFree(image) );
-//	checkCudaErrors( cudaFree(psf) );
-//	checkCudaErrors( cudaFreeHost(host_psf) );
-//
-//	for (int i = 0; i < num_streams; i++)
-//	{
-//		checkCudaErrors( cufftDestroy(fft_plans[i]) );
-//		checkCudaErrors( cudaStreamDestroy(streams[i]) );
-//		// checkCudaErrors( cudaFree(stream_buffers[i]) );
-//	}
-//
-//	checkCudaErrors( cudaFree(stream_buffers[1]) );
-//
-//	checkCudaErrors( cudaDeviceSynchronize() );
-//
-//	float *host_buffer;
-//	checkCudaErrors( cudaMallocHost((void **)&host_buffer, buffer_size) );
-//
-//	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], buffer_size, cudaMemcpyDeviceToHost) );
-//
-//	checkCudaErrors( cudaFree(stream_buffers[0]) );
-//
-//	if (argc == 2)
-//	{
-//		for (int slice = 0; slice < NUM_SLICES; slice++)
-//		{
-//			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
-//			imshow(B);
-//		}
-//	}
+	checkCudaErrors( cudaMemcpy(host_buffer, stream_buffers[0], buffer_size, cudaMemcpyDeviceToHost) );
+
+	checkCudaErrors( cudaFree(stream_buffers[0]) );
+
+	if (argc == 2)
+	{
+		for (int slice = 0; slice < NUM_SLICES; slice++)
+		{
+			cv::Mat B(N, N, CV_32FC1, host_buffer + N*N*slice);
+			imshow(B);
+		}
+	}
 
 	// TODO: reimplement cleanup code once satisfied with implementation
 
