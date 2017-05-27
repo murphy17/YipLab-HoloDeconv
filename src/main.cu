@@ -158,26 +158,107 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 	const int ii = N-i;
 	const int jj = N-j;
 
-	cufftComplex *z_;
-
-	// unrolling the conditionals likely inefficient... will need 4*NUM_SLICES times more reads
+	// this saves 8 registers (does it still?)
+	int cond = 0;
+	if (i>0&&i<N/2) cond |= 1;
+	if (j>0&&j<N/2) cond |= 2;
 
 	cufftComplex w_[4];
 	w_[0] = w[i*N+j];
-	if (i>0&&i<N/2) w_[1] = w[ii*N+j];
-	if (j>0&&j<N/2) w_[2] = w[i*N+jj];
-	if (i>0&&i<N/2&&j>0&&j<N/2) w_[3] = w[ii*N+jj];
+	if (cond & 1) w_[1] = w[ii*N+j];
+	if (cond & 2) w_[2] = w[i*N+jj];
+	if (cond == 3) w_[3] = w[ii*N+jj];
 
-	z_ = z;
-	for (int k = 0; k < NUM_SLICES; k++)
+	cufftComplex z_ij;
+
+	// conditional unwrapping
+	switch (cond)
 	{
-		cufftComplex z_ij = z_[i*N+j];
-		z_[i*N+j] = _multiply_helper(w_[0], z_ij);
-		if (i>0&&i<N/2) z_[ii*N+j] = _multiply_helper(w_[1], z_ij);
-		if (j>0&&j<N/2) z_[i*N+jj] = _multiply_helper(w_[2], z_ij);
-		if (i>0&&i<N/2&&j>0&&j<N/2) z_[ii*N+jj] = _multiply_helper(w_[3], z_ij);
-		z_ += N*N;
+		case 3:
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_ij = z[i*N+j];
+			z[i*N+j] = _multiply_helper(w_[0], z_ij);
+			z[ii*N+j] = _multiply_helper(w_[1], z_ij);
+			z[i*N+jj] = _multiply_helper(w_[2], z_ij);
+			z[ii*N+jj] = _multiply_helper(w_[3], z_ij);
+			z += N*N;
+		}
+		break;
+
+		case 2:
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_ij = z[i*N+j];
+			z[i*N+j] = _multiply_helper(w_[0], z_ij);
+			z[i*N+jj] = _multiply_helper(w_[2], z_ij);
+			z += N*N;
+		}
+		break;
+
+		case 1:
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_ij = z[i*N+j];
+			z[i*N+j] = _multiply_helper(w_[0], z_ij);
+			z[ii*N+j] = _multiply_helper(w_[1], z_ij);
+			z += N*N;
+		}
+		break;
+
+		case 0:
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_ij = z[i*N+j];
+			z[i*N+j] = _multiply_helper(w_[0], z_ij);
+			z += N*N;
+		}
+		break;
 	}
+
+	/*
+	// catch the stragglers... this would permit nice block/thread sizes, if it worked
+	if (i==N/2-1)
+	{
+		w_[0] = w[(i+1)*N+j];
+		w_[1] = w[(i+1)*N+jj];
+		z_ = z;
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			cufftComplex z_ij = z_[(i+1)*N+j];
+			z_[(i+1)*N+j] = _multiply_helper(w_[0], z_ij);
+			z_[(i+1)*N+jj] = _multiply_helper(w_[1], z_ij);
+			z_ += N*N;
+		}
+	}
+
+	if (j==N/2-1)
+	{
+		w_[0] = w[i*N+(j+1)];
+		w_[2] = w[ii*N+(j+1)];
+		z_ = z;
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			cufftComplex z_ij = z_[i*N+(j+1)];
+			z_[i*N+(j+1)] = _multiply_helper(w_[0], z_ij);
+			z_[ii*N+(j+1)] = _multiply_helper(w_[2], z_ij);
+			z_ += N*N;
+		}
+	}
+
+
+	if (i==N/2-1&&j==N/2-1)
+	{
+		w_[0] = w[(i+1)*N+(j+1)];
+		z_ = z;
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			cufftComplex z_ij = z_[(i+1)*N+(j+1)];
+			z_[(i+1)*N+(j+1)] = _multiply_helper(w_[0], z_ij);
+			z_ += N*N;
+		}
+	}
+	*/
 }
 
 __global__
