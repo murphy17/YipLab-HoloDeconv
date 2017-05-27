@@ -397,7 +397,7 @@ int main(int argc, char* argv[])
 
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
-		frequency_shift<<<N, N>>>(psf);
+		frequency_shift<<<N/2+1, N/2+1>>>(psf);
 
 		// TODO: the PSF quadrants themselves are symmetric matrices...
 
