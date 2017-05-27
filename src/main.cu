@@ -151,19 +151,19 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 	const int jj = N-j;
 
 	cufftComplex w_ = w[i*N+j];
-	cufftComplex *z_ = z;
+	cufftComplex *z_;
 
 	// once this is working move those conditionals outside the loop
 	// unless compiler is doing that already... no, it's not
 
-	if (i>0&&i<N/2&&j>0&&j<N/2)
+	z_ = z;
+	for (int k = 0; k < NUM_SLICES; k++)
 	{
-		for (int k = 0; k < NUM_SLICES; k++)
-		{
-			z_[ii*N+jj] = _multiply_helper(z_[ii*N+jj], w_);
-			z_ += N*N;
-		}
+		z_[i*N+j] = _multiply_helper(z_[i*N+j], w_);
+		z_ += N*N;
 	}
+
+	z_ = z;
 	if (i>0&&i<N/2)
 	{
 		for (int k = 0; k < NUM_SLICES; k++)
@@ -172,6 +172,8 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 			z_ += N*N;
 		}
 	}
+
+	z_ = z;
 	if (j>0&&j<N/2)
 	{
 		for (int k = 0; k < NUM_SLICES; k++)
@@ -180,10 +182,15 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 			z_ += N*N;
 		}
 	}
-	for (int k = 0; k < NUM_SLICES; k++)
+
+	z_ = z;
+	if (i>0&&i<N/2&&j>0&&j<N/2)
 	{
-		z_[i*N+j] = _multiply_helper(z_[i*N+j], w_);
-		z_ += N*N;
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			z_[ii*N+jj] = _multiply_helper(z_[ii*N+jj], w_);
+			z_ += N*N;
+		}
 	}
 }
 
@@ -235,7 +242,7 @@ int main(int argc, char* argv[])
 	int num_frames = 3;
 	float z_min = 30;
 	float z_step = 1;
-	int num_streams = 2;
+	int num_streams = 1;
 
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
@@ -332,8 +339,6 @@ int main(int argc, char* argv[])
 		// batch-multiply with FFT'ed image
 		quadrant_multiply<<<N/2+1, N/2+1, 0, stream>>>(buffer, image);
 //		batch_multiply<<<grid_dims, block_dims, 0, stream>>>(buffer, image);
-
-		checkCudaErrors( cudaGetLastError() );
 
 		// inverse FFT that product
 		// TODO: doing the modulus in here as callback would be quite nice, would like to retry
