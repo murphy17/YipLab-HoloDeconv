@@ -14,8 +14,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-//#include <opencv2/gpu/gpu.hpp>
-#include <opencv2/core/cuda.hpp>
+#include <opencv2/gpu/gpu.hpp>
+//#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
@@ -48,7 +48,8 @@ void imshow(cv::Mat in)
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
 }
-void imshow(cv::cuda::GpuMat in, bool log=false)
+
+void imshow(cv::gpu::GpuMat in) //, bool log=false)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -61,8 +62,8 @@ void imshow(cv::cuda::GpuMat in, bool log=false)
 		cv::magnitude(channels[0], channels[1], out);
 	}
 	out.convertTo(out, CV_32FC1);
-	if (log)
-		cv::log(out, out);
+//	if (log)
+//		cv::log(out, out);
 	cv::normalize(out, out, 1.0, 0.0, cv::NORM_MINMAX, -1);
 	cv::imshow("Display window", out); // Show our image inside it.
 	cv::waitKey(0);
@@ -122,7 +123,7 @@ void frequency_shift(cufftComplex *data)
 }
 
 __device__ __forceinline__
-cufftComplex _multiply_helper(cufftComplex a, cufftComplex b)
+cufftComplex _mul(cufftComplex a, cufftComplex b)
 {
 	cufftComplex c;
 
@@ -143,15 +144,18 @@ void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
-		z[i*N+j] = _multiply_helper(z[i*N+j], w_ij);
+		z[i*N+j] = _mul(z[i*N+j], w_ij);
 
 		z += N*N;
 	}
 }
 
-__device__
-void _quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w, int i, int j)
+__global__
+//__device__
+void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w) //, int i, int j)
 {
+	const int i = blockIdx.x;
+	const int j = threadIdx.x;
 	const int ii = N-i;
 	const int jj = N-j;
 
@@ -176,10 +180,10 @@ void _quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w, int
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _multiply_helper(w_[0], z_ij);
-			z[ii*N+j] = _multiply_helper(w_[1], z_ij);
-			z[i*N+jj] = _multiply_helper(w_[2], z_ij);
-			z[ii*N+jj] = _multiply_helper(w_[3], z_ij);
+			z[i*N+j] = _mul(w_[0], z_ij);
+			z[ii*N+j] = _mul(w_[1], z_ij);
+			z[i*N+jj] = _mul(w_[2], z_ij);
+			z[ii*N+jj] = _mul(w_[3], z_ij);
 			z += N*N;
 		}
 		break;
@@ -188,8 +192,8 @@ void _quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w, int
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _multiply_helper(w_[0], z_ij);
-			z[i*N+jj] = _multiply_helper(w_[2], z_ij);
+			z[i*N+j] = _mul(w_[0], z_ij);
+			z[i*N+jj] = _mul(w_[2], z_ij);
 			z += N*N;
 		}
 		break;
@@ -198,8 +202,8 @@ void _quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w, int
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _multiply_helper(w_[0], z_ij);
-			z[ii*N+j] = _multiply_helper(w_[1], z_ij);
+			z[i*N+j] = _mul(w_[0], z_ij);
+			z[ii*N+j] = _mul(w_[1], z_ij);
 			z += N*N;
 		}
 		break;
@@ -208,25 +212,25 @@ void _quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w, int
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _multiply_helper(w_[0], z_ij);
+			z[i*N+j] = _mul(w_[0], z_ij);
 			z += N*N;
 		}
 		break;
 	}
 }
 
-__global__
-void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
-{
-	const int i = blockIdx.x;
-	const int j = threadIdx.x;
-
-	// permits using nicely-sized kernel dimensions
-	_quadrant_multiply(z, w, i, j);
-	if (i == N/2-1) _quadrant_multiply(z, w, i+1, j);
-	if (j == N/2-1) _quadrant_multiply(z, w, i, j+1);
-	if (i == N/2-1 && j == N/2-1) _quadrant_multiply(z, w, i+1, j+1);
-}
+//__global__
+//void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+//{
+//	const int i = blockIdx.x;
+//	const int j = threadIdx.x;
+//
+//	// permits using nicely-sized kernel dimensions
+//	_quadrant_multiply(z, w, i, j);
+//	if (i == N/2-1) _quadrant_multiply(z, w, i+1, j);
+//	if (j == N/2-1) _quadrant_multiply(z, w, i, j+1);s
+//	if (i == N/2-1 && j == N/2-1) _quadrant_multiply(z, w, i+1, j+1);
+//}
 
 __global__
 void mirror_quadrants(cufftComplex *z)
@@ -249,6 +253,12 @@ void byte_to_complex(byte *b, cufftComplex *z)
 
 	z[i*N+j].x = ((float)(b[i*N+j])) / 255.f;
 	z[i*N+j].y = 0.f;
+}
+
+__device__ __forceinline__
+float _mod(cufftComplex z)
+{
+	return hypotf(z.x, z.y);
 }
 
 __global__
@@ -326,10 +336,6 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaMalloc((void **)&in_buffers[0], NUM_SLICES*N*N*sizeof(cufftComplex)) );
 	checkCudaErrors( cudaMalloc((void **)&in_buffers[1], NUM_SLICES*N*N*sizeof(cufftComplex)) );
 
-//	float *out_buffers[2];
-//	checkCudaErrors( cudaMalloc((void **)&out_buffers[0], NUM_SLICES*N*N*sizeof(float)) );
-//	checkCudaErrors( cudaMalloc((void **)&out_buffers[1], NUM_SLICES*N*N*sizeof(float)) );
-
 	float *out_buffer;
 	checkCudaErrors( cudaMalloc((void **)&out_buffer, NUM_SLICES*N*N*sizeof(float)) );
 
@@ -377,14 +383,6 @@ int main(int argc, char* argv[])
 				) );
 	}
 
-//	checkCudaErrors( cudaMemset(in_buffers[0], 0, NUM_SLICES*N*N*sizeof(cufftComplex)) ); // make sure works fine without this
-//	checkCudaErrors( cudaMemset(in_buffers[1], 0, NUM_SLICES*N*N*sizeof(cufftComplex)) ); // make sure works fine without this
-
-	// I only think one out buffer is needed
-//	checkCudaErrors( cudaMemset(out_buffer, 0, NUM_SLICES*N*N*sizeof(float)) ); // make sure works fine without this
-//	checkCudaErrors( cudaMemset(out_buffers[0], 0, NUM_SLICES*N*N*sizeof(float)) ); // make sure works fine without this
-//	checkCudaErrors( cudaMemset(out_buffers[1], 0, NUM_SLICES*N*N*sizeof(float)) ); // make sure works fine without this
-
 	// preemptively load PSF for the first frame
 	checkCudaErrors( transfer_psf(host_psf, in_buffers[0], copy_stream) );
 	checkCudaErrors( cudaStreamSynchronize(copy_stream) );
@@ -419,14 +417,14 @@ int main(int argc, char* argv[])
 
 //		for (int slice = 0; slice < NUM_SLICES; slice++)
 //		{
-//			imshow(cv::cuda::GpuMat(N, N, CV_32FC2, in_buffer + N*N*slice), false);
+//			imshow(cv::gpu::GpuMat(N, N, CV_32FC2, in_buffer + N*N*slice), false);
 //		}
 
 		// batch-multiply with FFT'ed image
-		quadrant_multiply<<<N/2, N/2, 0, math_stream>>>(in_buffer, image);
+		// TODO: write a wrapper that takes care of ugly dimension sizes
+		quadrant_multiply<<<N/2+1, N/2+1, 0, math_stream>>>(in_buffer, image);
 
 		// inverse FFT that product
-		// TODO: doing the modulus in here as callback would be quite nice, would like to retry
 		// I have yet to see any speedup from batching the FFTs
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
@@ -449,7 +447,7 @@ int main(int argc, char* argv[])
 	{
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			imshow(cv::cuda::GpuMat(N, N, CV_32FC1, out_buffer + N*N*slice));
+			imshow(cv::gpu::GpuMat(N, N, CV_32FC1, out_buffer + N*N*slice));
 		}
 	}
 
