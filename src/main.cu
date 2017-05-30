@@ -15,6 +15,7 @@
 
 #include "cuda_common.h"
 #include "cuda_half.hpp"
+#include "half.hpp"
 #include "util.hpp"
 
 //#define FP32
@@ -24,9 +25,9 @@
 #define DX (5.32f / 1024.f)
 #define DY (6.66f / 1280.f)
 #define DZ 1.f
-#define Z0 30
+#define Z0 80 // 30
 #define LAMBDA0 0.000488f
-#define NUM_SLICES 100
+#define NUM_SLICES 10
 #define NUM_FRAMES 3
 
 #ifdef FP32
@@ -282,7 +283,6 @@ int main(int argc, char* argv[])
 
 	complex *image;
 	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(complex)) );
-	// I generate the FFT of PSF in float regardless, precision just affects storage
 	complex *psf;
 	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(complex)) );
 
@@ -381,13 +381,13 @@ int main(int argc, char* argv[])
 		// up-cast to complex
 		byte_to_complex<<<N, N, 0, math_stream>>>(image_u8, image);
 #ifdef FP16
-		scale<<<N, N, 0, math_stream>>>(image, 1.f/N);
+		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
 #endif
 
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
 #ifdef FP16
-		scale<<<N, N, 0, math_stream>>>(image, 1.f/N);
+		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
 #endif
 
 		// random thought: an abstraction layer between kernel allocation and matrix dims would be nice
@@ -432,6 +432,12 @@ int main(int argc, char* argv[])
 									  out_buffer, sizeof(complex)/2, \
 									  sizeof(complex)/2, NUM_SLICES*N*N,
 									  cudaMemcpyDeviceToHost) );
+#ifdef FP_16
+		for (int i = 0; i < N*N*NUM_SLICES; i++)
+		{
+			result[i] = (float)(*(half_float::half *)&(result[i]));
+		}
+#endif
 
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
