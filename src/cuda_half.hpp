@@ -97,8 +97,8 @@ public:
 	inline __device__
 	half2(float a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__float2half2_rn(a); }
 
-	inline __device__
-	half2(float a, float b) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a, b); }
+//	inline __device__
+//	half2(float a, float b) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a, b); }
 
 	// assignment
 	inline __device__
@@ -110,8 +110,8 @@ public:
 	inline __device__
 	half2& operator=(float a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__float2half2_rn(a); return *this; }
 
-	inline __device__
-	half2& operator=(float2 a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a.x, a.y); return *this; }
+//	inline __device__
+//	half2& operator=(float2 a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a.x, a.y); return *this; }
 
 	// conversion
 	inline __device__

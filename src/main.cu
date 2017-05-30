@@ -64,7 +64,8 @@ void construct_psf(float z, T *g, float norm)
 	r = __fdividef(r, norm); // norm = -2.f * z / LAMBDA0
 
 	// re(iz) = -im(z), im(iz) = re(z)
-	g[i*N+j] = {__fdividef(-im, r), __fdividef(re, r)};
+	g[i*N+j].x = __fdividef(-im, r);
+	g[i*N+j].y = __fdividef(re, r);
 }
 
 // exploit Fourier duality to shift without copying
