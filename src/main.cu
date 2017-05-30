@@ -7,8 +7,6 @@
  *
  */
 
-#define TITAN
-
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 #include <cuda_runtime.h>
@@ -17,68 +15,33 @@
 
 #include "common.h"
 #include "cuda_half.hpp"
+#include "util.hpp"
 
-#ifdef TEGRA
-#include <opencv2/gpu/gpu.hpp>
-namespace cv_gpu = cv::gpu;
-#endif
-#ifdef TITAN
-#include <opencv2/core/cuda.hpp>
-namespace cv_gpu = cv::cuda;
-#endif
+#define FP32
+//#define FP16
 
 #define N 1024
-#define LOG2N 10
 #define DX (5.32f / 1024.f)
-#define DY (5.32f / 1024.f) // (6.66f / 1280.f) ... are these supposed to be the *SAME*? very close, but exact same helps a lot!
+#define DY (6.66f / 1280.f)
 #define LAMBDA0 0.000488f
 #define NUM_SLICES 100
 
+#ifdef FP32
+typedef cufftComplex complex;
+typedef float real;
+#endif
+#ifdef FP16
+typedef half2 complex;
+typedef half real;
+#endif
+
 typedef unsigned char byte;
-
-// Convenience method for plotting
-void imshow(cv::Mat in)
-{
-	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
-	cv::Mat out = in;
-	cudaDeviceSynchronize();
-	if (out.channels() == 2)
-	{
-		cv::Mat channels[2];
-		cv::split(out, channels);
-		cv::magnitude(channels[0], channels[1], out);
-	}
-	out.convertTo(out, CV_32FC1);
-	cv::normalize(out, out, 1.0, 0.0, cv::NORM_MINMAX, -1);
-	cv::imshow("Display window", out); // Show our image inside it.
-	cv::waitKey(0);
-}
-
-void imshow(cv_gpu::GpuMat in) //, bool log=false)
-{
-	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
-	cv::Mat out;
-	cudaDeviceSynchronize();
-	in.download(out);
-	if (out.channels() == 2)
-	{
-		cv::Mat channels[2];
-		cv::split(out, channels);
-		cv::magnitude(channels[0], channels[1], out);
-	}
-	out.convertTo(out, CV_32FC1);
-//	if (log)
-//		cv::log(out, out);
-	cv::normalize(out, out, 1.0, 0.0, cv::NORM_MINMAX, -1);
-	cv::imshow("Display window", out); // Show our image inside it.
-	cv::waitKey(0);
-}
 
 // Kernel to construct the point-spread function at distance z.
 // exploits 4-fold symmetry (PSF is also radially symmetric, but that's harder...)
 // note that answer is scaled between +/-1
 __global__
-void construct_psf(float z, cufftComplex *g, float norm)
+void construct_psf(float z, complex *g, float norm)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
@@ -99,7 +62,7 @@ void construct_psf(float z, cufftComplex *g, float norm)
 	r = __fdividef(r, norm); // norm = -2.f * z / LAMBDA0
 
 	// re(iz) = -im(z), im(iz) = re(z)
-	cufftComplex g_ij;
+	complex g_ij;
 	g_ij.x = __fdividef(-im, r); // im, r);
 	g_ij.y = __fdividef(re, r);
 
@@ -122,12 +85,12 @@ void frequency_shift(T *data)
 	data[i*N+j].y *= a;
 }
 
+template <class T>
 __device__ __forceinline__
-cufftComplex _mul(cufftComplex a, cufftComplex b)
+T _mul(T a, T b)
 {
-	cufftComplex c;
+	T c;
 
-	// with O3 on this is fine
 	c.x = a.x * b.x - a.y * b.y;
 	c.y = a.x * b.y + a.y * b.x;
 
@@ -135,12 +98,12 @@ cufftComplex _mul(cufftComplex a, cufftComplex b)
 }
 
 __global__
-void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+void batch_multiply(complex *z, const __restrict__ complex *w)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
 
-	cufftComplex w_ij = w[i*N+j];
+	complex w_ij = w[i*N+j];
 
 	for (int k = 0; k < NUM_SLICES; k++)
 	{
@@ -152,7 +115,7 @@ void batch_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
 
 __global__
 //__device__
-void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w) //, int i, int j)
+void quadrant_multiply(complex *z, const __restrict__ complex *w) //, int i, int j)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
@@ -164,13 +127,13 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w) //, 
 	if (i>0&&i<N/2) cond |= 1;
 	if (j>0&&j<N/2) cond |= 2;
 
-	cufftComplex w_[4];
+	complex w_[4];
 	w_[0] = w[i*N+j];
 	if (cond & 1) w_[1] = w[ii*N+j];
 	if (cond & 2) w_[2] = w[i*N+jj];
 	if (cond == 3) w_[3] = w[ii*N+jj];
 
-	cufftComplex z_ij;
+	complex z_ij;
 
 	// conditional unwrapping
 	// this had no effect, but compiler didn't seem to be doing it?
@@ -220,7 +183,7 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w) //, 
 }
 
 //__global__
-//void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w)
+//void quadrant_multiply(complex *z, const __restrict__ complex *w)
 //{
 //	const int i = blockIdx.x;
 //	const int j = threadIdx.x;
@@ -233,7 +196,7 @@ void quadrant_multiply(cufftComplex *z, const __restrict__ cufftComplex *w) //, 
 //}
 
 __global__
-void mirror_quadrants(cufftComplex *z)
+void mirror_quadrants(complex *z)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
@@ -246,7 +209,7 @@ void mirror_quadrants(cufftComplex *z)
 }
 
 __global__
-void byte_to_complex(byte *b, cufftComplex *z)
+void byte_to_complex(byte *b, complex *z)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
@@ -256,13 +219,13 @@ void byte_to_complex(byte *b, cufftComplex *z)
 }
 
 __device__ __forceinline__
-float _mod(cufftComplex z)
+float _mod(complex z)
 {
 	return hypotf(z.x, z.y);
 }
 
 __global__
-void complex_modulus(cufftComplex *z, float *r)
+void complex_modulus(complex *z, float *r)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
@@ -277,7 +240,7 @@ void complex_modulus(cufftComplex *z, float *r)
 }
 
 __global__
-void copy_buffer(cufftComplex *a, cufftComplex *b)
+void copy_buffer(complex *a, complex *b)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
@@ -285,18 +248,18 @@ void copy_buffer(cufftComplex *a, cufftComplex *b)
 	b[i*N+j] = a[i*N+j];
 }
 
-cudaError_t transfer_psf(cufftComplex *psf, cufftComplex *buffer, cudaStream_t stream)
+cudaError_t transfer_psf(complex *psf, complex *buffer, cudaStream_t stream)
 {
 	cudaMemcpy3DParms p = { 0 };
 	p.srcPtr.ptr = psf;
-	p.srcPtr.pitch = (N/2+1) * sizeof(cufftComplex);
+	p.srcPtr.pitch = (N/2+1) * sizeof(complex);
 	p.srcPtr.xsize = (N/2+1);
 	p.srcPtr.ysize = (N/2+1);
 	p.dstPtr.ptr = buffer;
-	p.dstPtr.pitch = N * sizeof(cufftComplex);
+	p.dstPtr.pitch = N * sizeof(complex);
 	p.dstPtr.xsize = N;
 	p.dstPtr.ysize = N;
-	p.extent.width = (N/2+1) * sizeof(cufftComplex);
+	p.extent.width = (N/2+1) * sizeof(complex);
 	p.extent.height = (N/2+1);
 	p.extent.depth = NUM_SLICES;
 	p.kind = cudaMemcpyHostToDevice;
@@ -304,21 +267,10 @@ cudaError_t transfer_psf(cufftComplex *psf, cufftComplex *buffer, cudaStream_t s
 	return cudaMemcpy3DAsync(&p, stream);
 }
 
-__global__
-void half_test(float *f)
-{
-	half x = 1.f;
-	half y;
-	y = 2.f;
-
-	x += y;
-
-	f[0] = (float)x;
-}
-
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
+
 
 	int num_frames = 3;
 	float z_min = 30;
@@ -327,15 +279,13 @@ int main(int argc, char* argv[])
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
 
-	cufftComplex *image;
-	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(cufftComplex)) );
-	cufftComplex *psf;
-	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(cufftComplex)) );
+	complex *image;
+	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(complex)) );
+	complex *psf;
+	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(complex)) );
 
-	// allocate this on the host - that way CPU can manage transfer, not GPU, lets it run in async
-	// (this is 3x slower on Titan, but faster on Tegra - recall that host and GPU memory are the same thing in Tegra)
-	cufftComplex *host_psf;
-	checkCudaErrors( cudaMallocHost((void **)&host_psf, NUM_SLICES*(N/2+1)*(N/2+1)*sizeof(cufftComplex)) );
+	complex *host_psf;
+	checkCudaErrors( cudaMallocHost((void **)&host_psf, NUM_SLICES*(N/2+1)*(N/2+1)*sizeof(complex)) );
 
 	byte *image_u8;
 	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
@@ -344,9 +294,9 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
-	cufftComplex *in_buffers[2];
-	checkCudaErrors( cudaMalloc((void **)&in_buffers[0], NUM_SLICES*N*N*sizeof(cufftComplex)) );
-	checkCudaErrors( cudaMalloc((void **)&in_buffers[1], NUM_SLICES*N*N*sizeof(cufftComplex)) );
+	complex *in_buffers[2];
+	checkCudaErrors( cudaMalloc((void **)&in_buffers[0], NUM_SLICES*N*N*sizeof(complex)) );
+	checkCudaErrors( cudaMalloc((void **)&in_buffers[1], NUM_SLICES*N*N*sizeof(complex)) );
 
 	float *out_buffer;
 	checkCudaErrors( cudaMalloc((void **)&out_buffer, NUM_SLICES*N*N*sizeof(float)) );
@@ -365,20 +315,15 @@ int main(int argc, char* argv[])
 	{
 		float z = z_min + z_step * slice;
 
-//		checkCudaErrors( cudaMemset(psf, 0, N*N*sizeof(cufftComplex)) ); // make sure works fine without this
+//		checkCudaErrors( cudaMemset(psf, 0, N*N*sizeof(complex)) ); // make sure works fine without this
 
 		// generate the PSF, weakly taking advantage of symmetry to speed up
 		construct_psf<<<N/2+1, N/2+1>>>(z, psf, -2.f * z / LAMBDA0);
-
-		// testing symmetry
 		mirror_quadrants<<<N/2+1, N/2+1>>>(psf);
 
 		// FFT in-place
 		checkCudaErrors( cufftXtExec(fft_plan, psf, psf, CUFFT_FORWARD) );
 		checkCudaErrors( cudaStreamSynchronize(math_stream) );
-
-		// testing symmetry
-		// mirror_quadrants<<<N/2+1, N/2+1, 0, streams[0]>>>(psf);
 
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
@@ -388,9 +333,9 @@ int main(int argc, char* argv[])
 
 		// copy the upper-left submatrix
 		checkCudaErrors( cudaMemcpy2D( \
-				host_psf + (N/2+1)*(N/2+1)*slice, (N/2+1)*sizeof(cufftComplex), \
-				psf, N*sizeof(cufftComplex), \
-				(N/2+1)*sizeof(cufftComplex), N/2+1, \
+				host_psf + (N/2+1)*(N/2+1)*slice, (N/2+1)*sizeof(complex), \
+				psf, N*sizeof(complex), \
+				(N/2+1)*sizeof(complex), N/2+1, \
 				cudaMemcpyDeviceToHost \
 				) );
 	}
@@ -406,7 +351,7 @@ int main(int argc, char* argv[])
 
 	for (int frame = 0; frame < num_frames; frame++)
 	{
-		cufftComplex *in_buffer = in_buffers[frame % 2];
+		complex *in_buffer = in_buffers[frame % 2];
 
 		// wait for a frame...
 		while (!frameReady) { ; }
