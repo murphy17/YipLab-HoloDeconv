@@ -88,7 +88,10 @@ template <class T>
 __device__ __forceinline__
 T _mul(T a, T b)
 {
-	return {a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x};
+	T c;
+	c.x = a.x * b.x - a.y * b.y;
+	c.y = a.x * b.y + a.y * b.x;
+	return c;
 }
 
 template <class T>
@@ -244,6 +247,7 @@ void complex_modulus(T1 *z, T2 *r)
 	}
 }
 
+// this is why I want to try thrust, this as a standalone method is dumb
 // holding off templating until I've setup float2 library...
 __global__
 void scale(half2 *x, half a)
@@ -251,10 +255,7 @@ void scale(half2 *x, half a)
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	for (int slice = 0; slice < NUM_SLICES; slice++)
-	{
-		x[i*N+j] = x[i*N+j] * a;
-	}
+	x[i*N+j] *= a; // multiplication is not working, investigate tomorrow
 }
 
 template <typename T>
@@ -380,9 +381,12 @@ int main(int argc, char* argv[])
 
 		// up-cast to complex
 		byte_to_complex<<<N, N, 0, math_stream>>>(image_u8, image);
+
 #ifdef FP16
 		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
 #endif
+		// half-precision PSF has weird artifacts in spatial domain
+		view_gpu(image, N*N, false);
 
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
