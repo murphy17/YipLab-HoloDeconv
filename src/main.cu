@@ -11,13 +11,12 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
-#include <opencv2/gpu/gpu.hpp>
-//#include <opencv2/core/cuda.hpp>
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
 
 #include "common.h"
+#include "cuda_half.hpp"
 
 #ifdef TEGRA
 #include <opencv2/gpu/gpu.hpp>
@@ -84,9 +83,6 @@ void construct_psf(float z, cufftComplex *g, float norm)
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-//	const int ii = (N - 1) - i;
-//	const int jj = (N - 1) - j;
-
 	// 'FFT-even symmetry' - periodic extension must be symmetric about (0,0)
 	float x = (i - N/2) * DX;
 	float y = (j - N/2) * DY;
@@ -109,15 +105,13 @@ void construct_psf(float z, cufftComplex *g, float norm)
 
 	// CUDA takes care of coalescing the reversed access, this is fine
 	g[i*N+j] = g_ij;
-//	g[i*N+jj] = g_ij;
-//	g[ii*N+j] = g_ij;
-//	g[ii*N+jj] = g_ij;
 }
 
 // exploit Fourier duality to shift without copying
 // credit to http://www.orangeowlsolutions.com/archives/251
+template <class T>
 __global__
-void frequency_shift(cufftComplex *data)
+void frequency_shift(T *data)
 {
     const int i = blockIdx.x;
     const int j = threadIdx.x;
@@ -310,11 +304,23 @@ cudaError_t transfer_psf(cufftComplex *psf, cufftComplex *buffer, cudaStream_t s
 	return cudaMemcpy3DAsync(&p, stream);
 }
 
+__global__
+void half_test(float *f)
+{
+	half x = 1.f;
+	half y;
+	y = 2.f;
+
+	x += y;
+
+	f[0] = (float)x;
+}
+
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
-	int num_frames = 5;
+	int num_frames = 3;
 	float z_min = 30;
 	float z_step = 1;
 
