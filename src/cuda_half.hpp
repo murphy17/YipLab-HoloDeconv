@@ -3,6 +3,7 @@
  *
  * Establish common interface between half and float types.
  * haven't defined int stuff
+ * ... these ops aren't defined for normal float2 ...
  *
  *  Created on: May 30, 2017
  *      Author: michaelmurphy
@@ -163,6 +164,14 @@ public:
 
 	inline __device__
     half2 operator/=(half a) { return (*this = *this / a); }
+};
+
+// special methods
+inline __device__
+half dot(half2 x, half2 y) { half2 z = x * y; return z.x + z.y; }
+
+inline __device__
+half length(half2 x) { return dot(x, x); }
 
 //	// lerp
 //	inline __device__ float2 lerp(float2 a, float2 b, float t)
@@ -217,6 +226,6 @@ public:
 //	{
 //		return make_float2(fabs(v.x), fabs(v.y));
 //	}
-};
+//};
 
 #endif
