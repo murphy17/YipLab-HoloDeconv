@@ -7,10 +7,7 @@
  *
  */
 
-// this is the fastest yet on Tegra, keeping PSF on device gives fastest yet on Titan
-// ... consumes a TON of memory. immediately fills the Tegra
-// could serialize batches of slices, I suppose - hiding latency of multiply is main thing
-// ... I've got an experiment for the multiply in the works, would require transposing the PSF cube though
+#define TITAN
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
@@ -21,6 +18,15 @@
 #include <algorithm>
 
 #include "common.h"
+
+#ifdef TEGRA
+#include <opencv2/gpu/gpu.hpp>
+namespace cv_gpu = cv::gpu;
+#endif
+#ifdef TITAN
+#include <opencv2/core/cuda.hpp>
+namespace cv_gpu = cv::cuda;
+#endif
 
 #define N 1024
 #define LOG2N 10
@@ -49,7 +55,7 @@ void imshow(cv::Mat in)
 	cv::waitKey(0);
 }
 
-void imshow(cv::gpu::GpuMat in) //, bool log=false)
+void imshow(cv_gpu::GpuMat in) //, bool log=false)
 {
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::Mat out;
@@ -417,7 +423,7 @@ int main(int argc, char* argv[])
 
 //		for (int slice = 0; slice < NUM_SLICES; slice++)
 //		{
-//			imshow(cv::gpu::GpuMat(N, N, CV_32FC2, in_buffer + N*N*slice), false);
+//			imshow(cv_gpu::GpuMat(N, N, CV_32FC2, in_buffer + N*N*slice), false);
 //		}
 
 		// batch-multiply with FFT'ed image
@@ -447,7 +453,7 @@ int main(int argc, char* argv[])
 	{
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			imshow(cv::gpu::GpuMat(N, N, CV_32FC1, out_buffer + N*N*slice));
+			imshow(cv_gpu::GpuMat(N, N, CV_32FC1, out_buffer + N*N*slice));
 		}
 	}
 
