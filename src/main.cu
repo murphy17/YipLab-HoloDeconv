@@ -18,8 +18,8 @@
 #include "half.hpp"
 #include "util.hpp"
 
-//#define FP32
-#define FP16
+#define FP32
+//#define FP16
 
 #define N 1024
 #define DX (5.32f / 1024.f)
