@@ -92,8 +92,6 @@ float2 conj(float2 a)
 	return c;
 }
 
-// would take even fewer instructions once you got this right
-// just multiply terms once, then +/-
 __device__ __forceinline__
 float2 cmul(float2 a, float2 b)
 {
@@ -103,34 +101,7 @@ float2 cmul(float2 a, float2 b)
 	return c;
 }
 
-__device__ __forceinline__
-float2 cmul_conjA(float2 a, float2 b)
-{
-	float2 c;
-//	float2 a_conj = conj(a);
-//	c.x = a_conj.x * b.x - a_conj.y * b.y;
-//	c.y = a_conj.x * b.y + a_conj.y * b.x;
-	c.x = a.x * b.x + a.y * b.y;
-	c.y = a.x * b.y - a.y * b.x;
-	return c;
-}
-
-// x <- a*b, y <-conj(a)*b
-__device__ __forceinline__
-void cmul_sym(float2 a, float2 b, float2 *x, float2 *y)
-{
-	float ax_bx = a.x * b.x;
-	float ax_by = a.x * b.y;
-	float ay_bx = a.y * b.x;
-	float ay_by = a.y * b.y;
-
-	x->x = ax_bx - ay_by;
-	x->y = ax_by + ay_bx;
-	y->x = ax_bx + ay_by;
-	y->y = ax_by - ay_bx;
-}
-
-// lightly exploiting Hermitianness of w as well now
+// using fourfold symmetry of z, Hermitian symmetry of w
 template <class T>
 __global__
 void quadrant_multiply(T *z, T *w) //, int i, int j)
@@ -200,19 +171,6 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 		break;
 	}
 }
-
-//__global__
-//void quadrant_multiply(complex *z, const __restrict__ complex *w)
-//{
-//	const int i = blockIdx.x;
-//	const int j = threadIdx.x;
-//
-//	// permits using nicely-sized kernel dimensions
-//	_quadrant_multiply(z, w, i, j);
-//	if (i == N/2-1) _quadrant_multiply(z, w, i+1, j);
-//	if (j == N/2-1) _quadrant_multiply(z, w, i, j+1);s
-//	if (i == N/2-1 && j == N/2-1) _quadrant_multiply(z, w, i+1, j+1);
-//}
 
 template<typename T>
 __global__
