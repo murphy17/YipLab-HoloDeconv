@@ -18,6 +18,7 @@ namespace cuda_fp16
 }
 
 // maybe get rid of assignment ops from native types? can replace with constructor wherever needed?
+// scalar left-multiply/right-multiply not defined?
 
 class half
 {

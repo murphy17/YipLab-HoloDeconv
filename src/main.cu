@@ -83,42 +83,54 @@ void frequency_shift(T *data)
 	data[i*N+j].y *= a;
 }
 
+__device__ __forceinline__
+float2 conj(float2 a)
+{
+	float2 c;
+	c.x = a.x;
+	c.y = -a.y;
+	return c;
+}
+
 // would take even fewer instructions once you got this right
 // just multiply terms once, then +/-
 __device__ __forceinline__
-float2 _mul(float2 a, float2 b)
+float2 cmul(float2 a, float2 b)
 {
 	float2 c;
 	c.x = a.x * b.x - a.y * b.y;
 	c.y = a.x * b.y + a.y * b.x;
 	return c;
 }
-__device__ __forceinline__
-half2 _mul(half2 a, half2 b)
-{
-	return cmul(a, b);
-}
-
-// wtf
-//template <class T>
-//__device__ __forceinline__
-//T _mul_conjA(T a, T b)
-//{
-//	T c;
-//	c.x = a.x * b.x - a.y * b.y;
-//	c.y = a.x * b.y + a.y * b.x;
-//	return c;
-//}
 
 __device__ __forceinline__
-complex _conj(complex a)
+float2 cmul_conjA(float2 a, float2 b)
 {
-	complex c;
-	c.x = a.x;
-	c.y = -a.y;
+	float2 c;
+//	float2 a_conj = conj(a);
+//	c.x = a_conj.x * b.x - a_conj.y * b.y;
+//	c.y = a_conj.x * b.y + a_conj.y * b.x;
+	c.x = a.x * b.x + a.y * b.y;
+	c.y = a.x * b.y - a.y * b.x;
 	return c;
 }
 
+// x <- a*b, y <-conj(a)*b
+__device__ __forceinline__
+void cmul_sym(float2 a, float2 b, float2 *x, float2 *y)
+{
+	float ax_bx = a.x * b.x;
+	float ax_by = a.x * b.y;
+	float ay_bx = a.y * b.x;
+	float ay_by = a.y * b.y;
+
+	x->x = ax_bx - ay_by;
+	x->y = ax_by + ay_bx;
+	y->x = ax_bx + ay_by;
+	y->y = ax_by - ay_bx;
+}
+
+// lightly exploiting Hermitianness of w as well now
 template <class T>
 __global__
 void quadrant_multiply(T *z, T *w) //, int i, int j)
@@ -133,11 +145,10 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 	if (i>0&&i<N/2) cond |= 1;
 	if (j>0&&j<N/2) cond |= 2;
 
-	T w_[4];
-	w_[0] = w[i*N+j];
-	if (cond & 1) w_[1] = w[ii*N+j];
-	if (cond & 2) w_[2] = w[i*N+jj];
-	if (cond == 3) w_[3] = w[ii*N+jj];
+	T w1, w2;
+	w1 = w[i*N+j];
+	if (cond & 1) w2 = w[ii*N+j];
+	else if (cond == 2) w2 = w[i*N+jj];
 
 	T z_ij;
 
@@ -149,10 +160,12 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _mul(w_[0], z_ij);
-			z[ii*N+j] = _mul(w_[1], z_ij);
-			z[i*N+jj] = _mul(w_[2], z_ij); // passing in conj(w_[1]) *works* here. but mul_conjA... doesn't!?!?!?!?!?
-			z[ii*N+jj] = _mul(w_[3], z_ij);
+
+			z[i*N+j] = cmul(w1, z_ij);
+			z[ii*N+jj] = cmul(conj(w1), z_ij);
+			z[ii*N+j] = cmul(w2, z_ij);
+			z[i*N+jj] = cmul(conj(w2), z_ij);
+
 			z += N*N;
 		}
 		break;
@@ -161,8 +174,8 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _mul(w_[0], z_ij);
-			z[i*N+jj] = _mul(w_[2], z_ij);
+			z[i*N+j] = cmul(w1, z_ij);
+			z[i*N+jj] = cmul(w2, z_ij);
 			z += N*N;
 		}
 		break;
@@ -171,8 +184,8 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _mul(w_[0], z_ij);
-			z[ii*N+j] = _mul(w_[1], z_ij);
+			z[i*N+j] = cmul(w1, z_ij);
+			z[ii*N+j] = cmul(w2, z_ij);
 			z += N*N;
 		}
 		break;
@@ -181,7 +194,7 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			z_ij = z[i*N+j];
-			z[i*N+j] = _mul(w_[0], z_ij);
+			z[i*N+j] = cmul(w1, z_ij);
 			z += N*N;
 		}
 		break;
@@ -233,9 +246,7 @@ void scale(half2 *x, float a)
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	half2 a_ = a;
-
-	x[i*N+j] *= a_; // multiplication is not working, investigate tomorrow
+	x[i*N+j] *= (half2)a; // multiplication is not working, investigate tomorrow
 }
 __global__
 void scale(half2 *x, half a)
