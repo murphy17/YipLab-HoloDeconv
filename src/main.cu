@@ -83,6 +83,8 @@ void frequency_shift(T *data)
 	data[i*N+j].y *= a;
 }
 
+// would take even fewer instructions once you got this right
+// just multiply terms once, then +/-
 template <class T>
 __device__ __forceinline__
 T _mul(T a, T b)
@@ -90,6 +92,24 @@ T _mul(T a, T b)
 	T c;
 	c.x = a.x * b.x - a.y * b.y;
 	c.y = a.x * b.y + a.y * b.x;
+	return c;
+}
+template <class T>
+__device__ __forceinline__
+T _mul_conjA(T a, T b)
+{
+	T c;
+	c.x = a.x * b.x + a.y * b.y;
+	c.y = a.x * b.y - a.y * b.x;
+	return c;
+}
+
+__device__ __forceinline__
+complex _conj(complex a)
+{
+	complex c;
+	c.x = a.x;
+	c.y = -a.y;
 	return c;
 }
 
@@ -200,15 +220,19 @@ void byte_to_complex(byte *b, T *z)
 	z[i*N+j].y = 0.f;
 }
 
-// this is why I want to try thrust, this as a standalone method is dumb
-// holding off templating until I've setup float2 library...
+// careful!!! half is an OBJECT now, so it gets passed as a *reference* ???
 __global__
-void scale(half2 *x, half a)
+void scale(half2 *x, float a)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
 	x[i*N+j] *= a; // multiplication is not working, investigate tomorrow
+}
+__global__
+void scale(half2 *x, half a)
+{
+	// not implemented
 }
 
 template <typename T>
@@ -254,6 +278,27 @@ void modulus(half2 *z, half *r)
 	*(half2 *)&(r[blockIdx.x * N + threadIdx.x]) = sqrt(r2);
 }
 
+//__global__
+//void test(float2 *d)
+//{
+////	half2 x = {1.0f, 2.0f};
+//	half2 x; x.x = 1.0f; x.y = 2.0f;
+////	half2 y = {3.0f, -5.0f};
+////	half2 z = cmul(x,y);
+//	half2 z = conj(x);
+//	d[0] = (float2)z;
+//}
+
+//int main()
+//{
+//	float2 *d;
+//	float2 h;
+//	cudaMalloc(&d, sizeof(float2));
+//	test<<<1,1>>>(d);
+//	cudaMemcpy(&h, d, sizeof(float2), cudaMemcpyDeviceToHost);
+//	std::cout << h.x << " " << h.y << std::endl;
+//}
+
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
@@ -277,7 +322,7 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaMalloc((void **)&in_buffers[0], NUM_SLICES*N*N*sizeof(complex)) );
 	checkCudaErrors( cudaMalloc((void **)&in_buffers[1], NUM_SLICES*N*N*sizeof(complex)) );
 
-	float *out_buffer;
+	real *out_buffer;
 	checkCudaErrors( cudaMalloc((void **)&out_buffer, NUM_SLICES*N*N*sizeof(real)) );
 
 	cudaDataType fft_type;
@@ -359,15 +404,13 @@ int main(int argc, char* argv[])
 #ifdef FP16
 		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
 #endif
-		// half-precision PSF has weird artifacts in spatial domain
-//		view_gpu(image, N*N, false);
 
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
-#ifdef FP16
-		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
-#endif
 
+//#ifdef FP16
+//		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
+//#endif
 		// random thought: an abstraction layer between kernel allocation and matrix dims would be nice
 		// will likely involve template method
 
@@ -375,15 +418,22 @@ int main(int argc, char* argv[])
 		// TODO: write a wrapper that takes care of ugly dimension sizes
 		quadrant_multiply<<<N/2+1, N/2+1, 0, math_stream>>>(in_buffer, image);
 
-		// inverse FFT that product
-		// I have yet to see any speedup from batching the FFTs
+		// inverse FFT the product - batch FFT gave no speedup
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
 			checkCudaErrors( cufftXtExec(fft_plan,
 										 in_buffer + N*N*slice,
 										 in_buffer + N*N*slice,
 										 CUFFT_INVERSE) );
+
+			// error is either in the modulus or host side
+
+#ifdef FP16
+			modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
+#endif
+#ifdef FP32
 			modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
+#endif
 		}
 
 		// start timer after first run, GPU "warmup"

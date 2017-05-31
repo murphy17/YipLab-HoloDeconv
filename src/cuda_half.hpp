@@ -79,14 +79,14 @@ public:
 class half2
 {
 public:
-	half x, y;
+	half x, y; // note the high 4 bytes are y, low 4 bytes are x
 
 	// constructors
 	inline __device__
 	half2() { ; }
 
-//	inline __device__
-//	half2(cuda_fp16::half a) { x = a; y = a; }
+	inline __device__
+	half2(cuda_fp16::half a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__half2half2(a); }
 
 	inline __device__
 	half2(cuda_fp16::half a, cuda_fp16::half b) { x = a; y = b; }
@@ -97,12 +97,12 @@ public:
 //	inline __device__
 //	half2(float a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__float2half2_rn(a); }
 
-//	inline __device__
-//	half2(float a, float b) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a, b); }
+	inline __device__
+	half2(float a, float b) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a, b); }
 
 	// assignment
-//	inline __device__
-//	half2& operator=(cuda_fp16::half a) { x = a; y = a; return *this; }
+	inline __device__
+	half2& operator=(cuda_fp16::half a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__half2half2(a); return *this; }
 
 	inline __device__
 	half2& operator=(cuda_fp16::half2 a) { *(half2 *)&x = a; return *this; }
@@ -168,64 +168,30 @@ public:
 
 // math methods
 inline __device__
-half sqrt(half x) { return cuda_fp16::hsqrt(x); };
+half sqrt(half a) { return half(cuda_fp16::hsqrt(a)); };
 
 inline __device__
-half2 sqrt(half2 x) { return cuda_fp16::h2sqrt(x); };
+half2 sqrt(half2 a) { return half2(cuda_fp16::h2sqrt(a)); };
 
-//	// lerp
-//	inline __device__ float2 lerp(float2 a, float2 b, float t)
-//	{
-//	    return a + t*(b-a);
-//	}
-//
-//	// clamp
-//	inline __device__ float2 clamp(float2 v, float a, float b)
-//	{
-//	    return make_float2(clamp(v.x, a, b), clamp(v.y, a, b));
-//	}
-//
-//	inline __device__ float2 clamp(float2 v, float2 a, float2 b)
-//	{
-//	    return make_float2(clamp(v.x, a.x, b.x), clamp(v.y, a.y, b.y));
-//	}
-//
-//	// dot product
-//	inline __device__ float dot(float2 a, float2 b)
-//	{
-//	    return a.x * b.x + a.y * b.y;
-//	}
-//
-//	// length
-//	inline __device__ float length(float2 v)
-//	{
-//	    return sqrtf(dot(v, v));
-//	}
-//
-//	// normalize
-//	inline __device__ float2 normalize(float2 v)
-//	{
-//	    float invLen = rsqrtf(dot(v, v));
-//	    return v * invLen;
-//	}
-//
-//	// floor
-//	inline __device__ float2 floor(const float2 v)
-//	{
-//	    return make_float2(floor(v.x), floor(v.y));
-//	}
-//
-//	// reflect
-//	inline __device__ float2 reflect(float2 i, float2 n)
-//	{
-//		return i - 2.0f * n * dot(n,i);
-//	}
-//
-//	// absolute value
-//	inline __device__ float2 fabs(float2 v)
-//	{
-//		return make_float2(fabs(v.x), fabs(v.y));
-//	}
-//};
+inline __device__
+half2 flip(half2 a) { return half2(cuda_fp16::__lowhigh2highlow(a)); };
+
+inline __device__
+half2 conj(half2 a)
+{
+	half2 b(a);
+	*(int *)&b.x ^= 1 << 31;
+	return b;
+}
+
+inline __device__
+half2 cmul(half2 a, half2 b)
+{
+//	half2 c;
+//	c.x = a.x * b.x - a.y * b.y;
+//	c.y = a.x * b.y + a.y * b.x;
+//	return c;
+	return half2(cuda_fp16::__hfma2(b, half2(a.x), flip(conj(b)) * a.y));
+}
 
 #endif
