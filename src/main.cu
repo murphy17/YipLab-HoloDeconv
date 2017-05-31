@@ -25,9 +25,9 @@
 #define DX (5.32f / 1024.f)
 #define DY (6.66f / 1280.f)
 #define DZ 1.f
-#define Z0 80 // 30
+#define Z0 30
 #define LAMBDA0 0.000488f
-#define NUM_SLICES 10
+#define NUM_SLICES 100
 #define NUM_FRAMES 3
 
 #ifdef FP32
@@ -62,11 +62,10 @@ void construct_psf(float z, T *g, float norm)
 
 	// numerical conditioning, important for half-precision FFT
 	// also corrects the sign flip above
-	r = __fdividef(r, norm); // norm = -2.f * z / LAMBDA0
+	r = __fdividef(r, norm); // norm = -2.f * z / LAMBDA0 (also / N if half)
 
 	// re(iz) = -im(z), im(iz) = re(z)
-	g[i*N+j].x = __fdividef(-im, r);
-	g[i*N+j].y = __fdividef(re, r);
+	g[i*N+j] = {__fdividef(-im, r), __fdividef(re, r)};
 }
 
 // exploit Fourier duality to shift without copying
@@ -92,23 +91,6 @@ T _mul(T a, T b)
 	c.x = a.x * b.x - a.y * b.y;
 	c.y = a.x * b.y + a.y * b.x;
 	return c;
-}
-
-template <class T>
-__global__
-void batch_multiply(T *z, const __restrict__ T *w)
-{
-	const int i = blockIdx.x;
-	const int j = threadIdx.x;
-
-	T w_ij = w[i*N+j];
-
-	for (int k = 0; k < NUM_SLICES; k++)
-	{
-		z[i*N+j] = _mul(z[i*N+j], w_ij);
-
-		z += N*N;
-	}
 }
 
 template <class T>
@@ -218,35 +200,6 @@ void byte_to_complex(byte *b, T *z)
 	z[i*N+j].y = 0.f;
 }
 
-// not templated -- implementations a little different
-// would use auto return if templating
-__device__ __forceinline__
-float _mod(float2 z)
-{
-	return hypotf(z.x, z.y);
-}
-__device__ __forceinline__
-half _mod(half2 z)
-{
-	return length(z);
-}
-
-template <typename T1, typename T2>
-__global__
-void complex_modulus(T1 *z, T2 *r)
-{
-	const int i = blockIdx.x;
-	const int j = threadIdx.x; // blockDim shall equal N
-
-	for (int slice = 0; slice < NUM_SLICES; slice++)
-	{
-		r[i*N+j] = _mod(z[i*N+j]);
-
-		z += N*N;
-		r += N*N;
-	}
-}
-
 // this is why I want to try thrust, this as a standalone method is dumb
 // holding off templating until I've setup float2 library...
 __global__
@@ -261,6 +214,7 @@ void scale(half2 *x, half a)
 template <typename T>
 cudaError_t transfer_psf(T *psf, T *buffer, cudaStream_t stream)
 {
+	// generate parameters for 3D copy
 	cudaMemcpy3DParms p = { 0 };
 	p.srcPtr.ptr = psf;
 	p.srcPtr.pitch = (N/2+1) * sizeof(T);
@@ -276,6 +230,28 @@ cudaError_t transfer_psf(T *psf, T *buffer, cudaStream_t stream)
 	p.kind = cudaMemcpyHostToDevice;
 
 	return cudaMemcpy3DAsync(&p, stream);
+}
+
+__global__
+void modulus(float2 *z, float *r)
+{
+	const int offset = blockIdx.x * N + threadIdx.x;
+	r[offset] = hypotf(z[offset].x, z[offset].y);
+}
+// should run N/2 threads with this one
+__global__
+void modulus(half2 *z, half *r)
+{
+	int offset;
+	half2 r2, z2;
+
+	offset = blockIdx.x * N + threadIdx.x * 2;
+	z2 = z[offset]*z[offset];
+	r2.x = z2.x + z2.y;
+	offset++;
+	z2 = z[offset]*z[offset];
+	r2.y = z2.x + z2.y;
+	*(half2 *)&(r[blockIdx.x * N + threadIdx.x]) = sqrt(r2);
 }
 
 int main(int argc, char* argv[])
@@ -302,7 +278,7 @@ int main(int argc, char* argv[])
 	checkCudaErrors( cudaMalloc((void **)&in_buffers[1], NUM_SLICES*N*N*sizeof(complex)) );
 
 	float *out_buffer;
-	checkCudaErrors( cudaMalloc((void **)&out_buffer, NUM_SLICES*N*N*sizeof(float)) );
+	checkCudaErrors( cudaMalloc((void **)&out_buffer, NUM_SLICES*N*N*sizeof(real)) );
 
 	cudaDataType fft_type;
 #ifdef FP32
@@ -315,11 +291,10 @@ int main(int argc, char* argv[])
 	long long dims[] = {N, N};
 	size_t work_sizes = 0;
 	checkCudaErrors( cufftCreate(&fft_plan) );
-	checkCudaErrors( cufftXtMakePlanMany( \
-			fft_plan, 2, dims, \
-			NULL, 1, 0, fft_type, \
-			NULL, 1, 0, fft_type, \
-			1, &work_sizes, fft_type) );
+	checkCudaErrors( cufftXtMakePlanMany(fft_plan, 2, dims,
+										 NULL, 1, 0, fft_type,
+										 NULL, 1, 0, fft_type,
+										 1, &work_sizes, fft_type) );
 	checkCudaErrors( cufftSetStream(fft_plan, math_stream) );
 
 	// cache 1/4 of the PSF (could do 1/8th too)
@@ -346,12 +321,10 @@ int main(int argc, char* argv[])
 		// TODO: the PSF quadrants themselves are symmetric matrices...
 
 		// copy the upper-left submatrix
-		checkCudaErrors( cudaMemcpy2D( \
-				host_psf + (N/2+1)*(N/2+1)*slice, (N/2+1)*sizeof(complex), \
-				psf, N*sizeof(complex), \
-				(N/2+1)*sizeof(complex), N/2+1, \
-				cudaMemcpyDeviceToHost \
-				) );
+		checkCudaErrors( cudaMemcpy2D(host_psf + (N/2+1)*(N/2+1)*slice, (N/2+1)*sizeof(complex),
+									  psf, N*sizeof(complex),
+									  (N/2+1)*sizeof(complex), N/2+1,
+									  cudaMemcpyDeviceToHost) );
 	}
 
 	checkCudaErrors( cudaFree(psf) );
@@ -372,7 +345,8 @@ int main(int argc, char* argv[])
 		// wait for a frame...
 		while (!frameReady) { ; }
 		// ... and copy
-		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte), cudaMemcpyHostToDevice, math_stream) );
+		checkCudaErrors( cudaMemcpyAsync(image_u8, A.data, N*N*sizeof(byte),
+										 cudaMemcpyHostToDevice, math_stream) );
 
 		// queue transfer for next frame, waiting for it to finish if necessary(?)
 		checkCudaErrors( cudaStreamSynchronize(math_stream) );
@@ -386,7 +360,7 @@ int main(int argc, char* argv[])
 		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
 #endif
 		// half-precision PSF has weird artifacts in spatial domain
-		view_gpu(image, N*N, false);
+//		view_gpu(image, N*N, false);
 
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
@@ -405,11 +379,12 @@ int main(int argc, char* argv[])
 		// I have yet to see any speedup from batching the FFTs
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			checkCudaErrors( cufftXtExec(fft_plan, in_buffer + N*N*slice, in_buffer + N*N*slice, CUFFT_INVERSE) );
+			checkCudaErrors( cufftXtExec(fft_plan,
+										 in_buffer + N*N*slice,
+										 in_buffer + N*N*slice,
+										 CUFFT_INVERSE) );
+			modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
 		}
-
-		// complex modulus - faster to loop outside kernel, for some reason
-		complex_modulus<<<N, N, 0, math_stream>>>(in_buffer, out_buffer);
 
 		// start timer after first run, GPU "warmup"
 		if (frame == 0)

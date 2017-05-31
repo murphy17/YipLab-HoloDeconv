@@ -166,12 +166,12 @@ public:
     half2 operator/=(half a) { return (*this = *this / a); }
 };
 
-// special methods
+// math methods
 inline __device__
-half dot(half2 x, half2 y) { half2 z = x * y; return z.x + z.y; }
+half sqrt(half x) { return cuda_fp16::hsqrt(x); };
 
 inline __device__
-half length(half2 x) { return dot(x, x); }
+half2 sqrt(half2 x) { return cuda_fp16::h2sqrt(x); };
 
 //	// lerp
 //	inline __device__ float2 lerp(float2 a, float2 b, float t)
