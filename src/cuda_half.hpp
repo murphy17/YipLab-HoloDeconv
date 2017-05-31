@@ -17,6 +17,8 @@ namespace cuda_fp16
 	#include <cuda_fp16.h>
 }
 
+// maybe get rid of assignment ops from native types? can replace with constructor wherever needed?
+
 class half
 {
 private:
@@ -89,13 +91,16 @@ public:
 	half2(cuda_fp16::half a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__half2half2(a); }
 
 	inline __device__
+	half2(half a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__half2half2(a); }
+
+	inline __device__
+	half2(float a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__float2half2_rn(a); }
+
+	inline __device__
 	half2(cuda_fp16::half a, cuda_fp16::half b) { x = a; y = b; }
 
 	inline __device__
 	half2(cuda_fp16::half2 a) { *(cuda_fp16::half2 *)&x = a; }
-
-//	inline __device__
-//	half2(float a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__float2half2_rn(a); }
 
 	inline __device__
 	half2(float a, float b) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a, b); }

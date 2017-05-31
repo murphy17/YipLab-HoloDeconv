@@ -26,6 +26,34 @@ void h2_to_f2(half2 *h, float2 *f)
 {
 	f[blockIdx.x*blockDim.x+threadIdx.x] = h[blockIdx.x*blockDim.x+threadIdx.x];
 }
+__global__
+void h_to_f(half *h, float *f)
+{
+	f[blockIdx.x*blockDim.x+threadIdx.x] = h[blockIdx.x*blockDim.x+threadIdx.x];
+}
+
+void view_gpu(half *x, int elements, bool log)
+{
+	checkCudaErrors( cudaDeviceSynchronize() );
+
+	float *x_f;
+	checkCudaErrors( cudaMalloc(&x_f, elements*sizeof(float)) );
+	h_to_f<<<elements / 1024, 1024>>>(x, x_f);
+	float *x_h = new float[elements];
+	checkCudaErrors( cudaMemcpy(x_h, x_f, elements*sizeof(float), cudaMemcpyDeviceToHost) );
+
+	cv::Mat A(1024, 1024, CV_32FC1, x_h);
+	if (log)
+		cv::log(A, A);
+	cv::normalize(A, A, 1.0, 0.0, cv::NORM_MINMAX, -1);
+
+	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
+	cv::imshow("Display window", A); // Show our image inside it.
+	cv::waitKey(0);
+
+	checkCudaErrors( cudaFree(x_f) );
+	delete x_h;
+}
 
 void view_gpu(half2 *x, int elements, bool log)
 {

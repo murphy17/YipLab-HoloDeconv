@@ -18,8 +18,8 @@
 #include "half.hpp"
 #include "util.hpp"
 
-#define FP32
-//#define FP16
+//#define FP32
+#define FP16
 
 #define N 1024
 #define DX (5.32f / 1024.f)
@@ -85,24 +85,30 @@ void frequency_shift(T *data)
 
 // would take even fewer instructions once you got this right
 // just multiply terms once, then +/-
-template <class T>
 __device__ __forceinline__
-T _mul(T a, T b)
+float2 _mul(float2 a, float2 b)
 {
-	T c;
+	float2 c;
 	c.x = a.x * b.x - a.y * b.y;
 	c.y = a.x * b.y + a.y * b.x;
 	return c;
 }
-template <class T>
 __device__ __forceinline__
-T _mul_conjA(T a, T b)
+half2 _mul(half2 a, half2 b)
 {
-	T c;
-	c.x = a.x * b.x + a.y * b.y;
-	c.y = a.x * b.y - a.y * b.x;
-	return c;
+	return cmul(a, b);
 }
+
+// wtf
+//template <class T>
+//__device__ __forceinline__
+//T _mul_conjA(T a, T b)
+//{
+//	T c;
+//	c.x = a.x * b.x - a.y * b.y;
+//	c.y = a.x * b.y + a.y * b.x;
+//	return c;
+//}
 
 __device__ __forceinline__
 complex _conj(complex a)
@@ -145,7 +151,7 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 			z_ij = z[i*N+j];
 			z[i*N+j] = _mul(w_[0], z_ij);
 			z[ii*N+j] = _mul(w_[1], z_ij);
-			z[i*N+jj] = _mul(w_[2], z_ij);
+			z[i*N+jj] = _mul(w_[2], z_ij); // passing in conj(w_[1]) *works* here. but mul_conjA... doesn't!?!?!?!?!?
 			z[ii*N+jj] = _mul(w_[3], z_ij);
 			z += N*N;
 		}
@@ -227,7 +233,9 @@ void scale(half2 *x, float a)
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	x[i*N+j] *= a; // multiplication is not working, investigate tomorrow
+	half2 a_ = a;
+
+	x[i*N+j] *= a_; // multiplication is not working, investigate tomorrow
 }
 __global__
 void scale(half2 *x, half a)
@@ -263,67 +271,92 @@ void modulus(float2 *z, float *r)
 	r[offset] = hypotf(z[offset].x, z[offset].y);
 }
 // should run N/2 threads with this one
+// scaling needed to prevent overflow
 __global__
-void modulus(half2 *z, half *r)
+void modulus(half2 *z, half *r, float scale)
 {
-	int offset;
+	int offset = blockIdx.x * N + threadIdx.x * 2;
 	half2 r2, z2;
+	half2 scale_ = scale;
 
-	offset = blockIdx.x * N + threadIdx.x * 2;
-	z2 = z[offset]*z[offset];
+	z2 = z[offset] * scale_;
+	z2 *= z2;
 	r2.x = z2.x + z2.y;
+
 	offset++;
-	z2 = z[offset]*z[offset];
+
+	z2 = z[offset] * scale_;
+	z2 *= z2;
 	r2.y = z2.x + z2.y;
-	*(half2 *)&(r[blockIdx.x * N + threadIdx.x]) = sqrt(r2);
+
+	offset--;
+
+	*(half2 *)&r[offset] = sqrt(r2);
+}
+//__global__
+//void modulus(half2 *z, half *r)
+//{
+//	int offset = blockIdx.x * N + threadIdx.x;
+//	half2 z2;
+//
+//	z2 = z[offset] * z[offset];
+//	r[offset] = sqrt(z2.x+z2.y);
+//}
+
+__global__
+void half_to_float(half *h, float *f)
+{
+	f[blockIdx.x*N+threadIdx.x] = (float)h[blockIdx.x*N+threadIdx.x];
 }
 
-//__global__
-//void test(float2 *d)
-//{
-////	half2 x = {1.0f, 2.0f};
-//	half2 x; x.x = 1.0f; x.y = 2.0f;
-////	half2 y = {3.0f, -5.0f};
-////	half2 z = cmul(x,y);
-//	half2 z = conj(x);
-//	d[0] = (float2)z;
-//}
+//#define TESTING
 
-//int main()
-//{
-//	float2 *d;
-//	float2 h;
-//	cudaMalloc(&d, sizeof(float2));
-//	test<<<1,1>>>(d);
-//	cudaMemcpy(&h, d, sizeof(float2), cudaMemcpyDeviceToHost);
-//	std::cout << h.x << " " << h.y << std::endl;
-//}
+#ifdef TESTING
+__global__
+void test(float2 *d)
+{
+	half2 z = {3.0f, -5.0f};
+	half2 z2 = z * z;
+	d[0] = {(float)sqrt(z2.x+z2.y), 0.f};
+}
 
+int main()
+{
+	float2 *d;
+	float2 h;
+	cudaMalloc(&d, sizeof(float2));
+	test<<<1,1>>>(d);
+	cudaMemcpy(&h, d, sizeof(float2), cudaMemcpyDeviceToHost);
+	std::cout << h.x << " " << h.y << std::endl;
+}
+#endif
+
+#ifndef TESTING
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
 
 	complex *image;
-	checkCudaErrors( cudaMalloc((void **)&image, N*N*sizeof(complex)) );
+	checkCudaErrors( cudaMalloc(&image, N*N*sizeof(complex)) );
 	complex *psf;
-	checkCudaErrors( cudaMalloc((void **)&psf, N*N*sizeof(complex)) );
+	checkCudaErrors( cudaMalloc(&psf, N*N*sizeof(complex)) );
 
 	complex *host_psf;
-	checkCudaErrors( cudaMallocHost((void **)&host_psf, NUM_SLICES*(N/2+1)*(N/2+1)*sizeof(complex)) );
+	checkCudaErrors( cudaMallocHost(&host_psf, NUM_SLICES*(N/2+1)*(N/2+1)*sizeof(complex)) );
 
 	byte *image_u8;
-	checkCudaErrors( cudaMalloc((void **)&image_u8, N*N*sizeof(byte)) );
+	checkCudaErrors( cudaMalloc(&image_u8, N*N*sizeof(byte)) );
 
 	cudaStream_t math_stream, copy_stream;
 	checkCudaErrors( cudaStreamCreate(&math_stream) );
 	checkCudaErrors( cudaStreamCreate(&copy_stream) );
 
 	complex *in_buffers[2];
-	checkCudaErrors( cudaMalloc((void **)&in_buffers[0], NUM_SLICES*N*N*sizeof(complex)) );
-	checkCudaErrors( cudaMalloc((void **)&in_buffers[1], NUM_SLICES*N*N*sizeof(complex)) );
+	checkCudaErrors( cudaMalloc(&in_buffers[0], NUM_SLICES*N*N*sizeof(complex)) );
+	checkCudaErrors( cudaMalloc(&in_buffers[1], NUM_SLICES*N*N*sizeof(complex)) );
 
 	real *out_buffer;
-	checkCudaErrors( cudaMalloc((void **)&out_buffer, NUM_SLICES*N*N*sizeof(real)) );
+	checkCudaErrors( cudaMalloc(&out_buffer, NUM_SLICES*N*N*sizeof(real)) );
 
 	cudaDataType fft_type;
 #ifdef FP32
@@ -401,6 +434,7 @@ int main(int argc, char* argv[])
 		// up-cast to complex
 		byte_to_complex<<<N, N, 0, math_stream>>>(image_u8, image);
 
+		// haven't really investigated where best place is to scale, or what to scale by...
 #ifdef FP16
 		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
 #endif
@@ -408,9 +442,6 @@ int main(int argc, char* argv[])
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
 
-//#ifdef FP16
-//		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
-//#endif
 		// random thought: an abstraction layer between kernel allocation and matrix dims would be nice
 		// will likely involve template method
 
@@ -426,10 +457,8 @@ int main(int argc, char* argv[])
 										 in_buffer + N*N*slice,
 										 CUFFT_INVERSE) );
 
-			// error is either in the modulus or host side
-
 #ifdef FP16
-			modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
+			modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));
 #endif
 #ifdef FP32
 			modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
@@ -455,22 +484,22 @@ int main(int argc, char* argv[])
 
 	if (argc == 2)
 	{
-		float *result;
-		checkCudaErrors( cudaMallocHost((void **)&result, NUM_SLICES*N*N*sizeof(float)) );
-		checkCudaErrors( cudaMemcpy2D(result, sizeof(float), \
-									  out_buffer, sizeof(complex)/2, \
-									  sizeof(complex)/2, NUM_SLICES*N*N,
-									  cudaMemcpyDeviceToHost) );
-#ifdef FP_16
-		for (int i = 0; i < N*N*NUM_SLICES; i++)
-		{
-			result[i] = (float)(*(half_float::half *)&(result[i]));
-		}
+		float *h_out = new float[NUM_SLICES*N*N];
+		float *d_out;
+
+#ifdef FP16
+		checkCudaErrors( cudaMalloc(&d_out, NUM_SLICES*N*N*sizeof(float)) );
+		for (int i=0; i<NUM_SLICES; i++) { half_to_float<<<N, N>>>(out_buffer + i*N*N, d_out + i*N*N); }
 #endif
+#ifdef FP32
+		d_out = out_buffer;
+#endif
+		checkCudaErrors( cudaMemcpy(h_out, d_out, NUM_SLICES*N*N*sizeof(float), cudaMemcpyDeviceToHost) );
+		checkCudaErrors( cudaFree(d_out) );
 
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			imshow(cv::Mat(N, N, CV_32FC1, result + N*N*slice));
+			imshow(cv::Mat(N, N, CV_32FC1, h_out + N*N*slice));
 		}
 	}
 
@@ -478,3 +507,4 @@ int main(int argc, char* argv[])
 
 	return 0;
 }
+#endif
