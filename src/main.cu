@@ -111,27 +111,14 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 	const int ii = N-i;
 	const int jj = N-j;
 
-	// this saves 8 registers (does it still?)
-	int cond = 0;
-	if (i>0&&i<N/2) cond |= 1;
-	if (j>0&&j<N/2) cond |= 2;
+	T w1 = w[i*N+j];
 
-	T w1, w2;
-	w1 = w[i*N+j];
-	if (cond & 1) w2 = w[ii*N+j];
-	else if (cond == 2) w2 = w[i*N+jj];
-
-	T z_ij;
-
-	// conditional unwrapping
-	// this had no effect... but compiler didn't seem to be doing it?
-	switch (cond)
+	if ((i>0 && i<N/2) && (j>0 && j<N/2))
 	{
-		case 3:
+		T w2 = w[ii*N+j];
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			z_ij = z[i*N+j];
-
+			T z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
 			z[ii*N+jj] = cmul(conj(w1), z_ij);
 			z[ii*N+j] = cmul(w2, z_ij);
@@ -139,36 +126,37 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 
 			z += N*N;
 		}
-		break;
-
-		case 2:
+	}
+	else if (i>0 && i<N/2)
+	{
+		T w2 = w[ii*N+j];
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			z_ij = z[i*N+j];
-			z[i*N+j] = cmul(w1, z_ij);
-			z[i*N+jj] = cmul(w2, z_ij);
-			z += N*N;
-		}
-		break;
-
-		case 1:
-		for (int k = 0; k < NUM_SLICES; k++)
-		{
-			z_ij = z[i*N+j];
+			T z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
 			z[ii*N+j] = cmul(w2, z_ij);
 			z += N*N;
 		}
-		break;
-
-		case 0:
+	}
+	else if (j>0 && j<N/2)
+	{
+		T w2 = w[i*N+jj];
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			z_ij = z[i*N+j];
+			T z_ij = z[i*N+j];
+			z[i*N+j] = cmul(w1, z_ij);
+			z[i*N+jj] = cmul(w2, z_ij);
+			z += N*N;
+		}
+	}
+	else
+	{
+		for (int k = 0; k < NUM_SLICES; k++)
+		{
+			T z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
 			z += N*N;
 		}
-		break;
 	}
 }
 
