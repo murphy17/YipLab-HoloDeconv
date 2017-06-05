@@ -28,7 +28,7 @@
 #define Z0 30
 #define LAMBDA0 0.000488f
 #define NUM_SLICES 100
-#define NUM_FRAMES 3
+#define NUM_FRAMES 30
 
 #ifdef FP32
 typedef cufftComplex complex;
@@ -194,11 +194,6 @@ void scale(half2 *x, float a)
 
 	x[i*N+j] *= (half2)a; // multiplication is not working, investigate tomorrow
 }
-__global__
-void scale(half2 *x, half a)
-{
-	// not implemented
-}
 
 template <typename T>
 cudaError_t transfer_psf(T *psf, T *buffer, cudaStream_t stream)
@@ -248,17 +243,9 @@ void modulus(half2 *z, half *r, float scale)
 
 	offset--;
 
+	// write 2 at a time
 	*(half2 *)&r[offset] = sqrt(r2);
 }
-//__global__
-//void modulus(half2 *z, half *r)
-//{
-//	int offset = blockIdx.x * N + threadIdx.x;
-//	half2 z2;
-//
-//	z2 = z[offset] * z[offset];
-//	r[offset] = sqrt(z2.x+z2.y);
-//}
 
 __global__
 void half_to_float(half *h, float *f)
@@ -371,7 +358,7 @@ int main(int argc, char* argv[])
 	volatile bool frameReady = true; // this would be updated by the camera
 
 	// this would be a copy from a frame buffer on the Tegra
-	cv::Mat A = cv::imread("test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
+	cv::Mat A = cv::imread("../data/test_square.bmp", CV_LOAD_IMAGE_GRAYSCALE);
 
 	for (int frame = 0; frame < NUM_FRAMES; frame++)
 	{

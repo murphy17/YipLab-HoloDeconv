@@ -17,8 +17,8 @@ namespace cuda_fp16
 	#include <cuda_fp16.h>
 }
 
-// maybe get rid of assignment ops from native types? can replace with constructor wherever needed?
-// scalar left-multiply/right-multiply not defined?
+// explicit constructors?
+// scalar left-multiply/right-multiply not defined
 
 class half
 {
@@ -27,14 +27,17 @@ private:
 
 public:
 	// constructors
-	inline __device__
+	inline __host__ __device__
 	half() { ; }
 
-	inline __device__
+	inline __host__ __device__
 	half(cuda_fp16::half a) { _ = a; }
 
 	inline __device__
 	half(float a) { _ = cuda_fp16::__float2half(a); }
+
+	inline __host__ __device__
+	half(const half &a) { _ = a._; }
 
 	// assignment
 	inline __device__
@@ -85,7 +88,7 @@ public:
 	half x, y; // note the high 4 bytes are y, low 4 bytes are x
 
 	// constructors
-	inline __device__
+	inline __host__ __device__
 	half2() { ; }
 
 	inline __device__
@@ -97,14 +100,17 @@ public:
 	inline __device__
 	half2(float a) { *(cuda_fp16::half2 *)&x = cuda_fp16::__float2half2_rn(a); }
 
-	inline __device__
+	inline __host__ __device__
 	half2(cuda_fp16::half a, cuda_fp16::half b) { x = a; y = b; }
 
-	inline __device__
+	inline __host__ __device__
 	half2(cuda_fp16::half2 a) { *(cuda_fp16::half2 *)&x = a; }
 
 	inline __device__
 	half2(float a, float b) { *(cuda_fp16::half2 *)&x = cuda_fp16::__floats2half2_rn(a, b); }
+
+	inline __host__ __device__
+	half2(const half2 &a) { *(cuda_fp16::half2 *)&x = *(cuda_fp16::half2 *)&(a.x); }
 
 	// assignment
 	inline __device__
