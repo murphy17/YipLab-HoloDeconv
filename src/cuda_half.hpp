@@ -17,7 +17,7 @@ namespace cuda_fp16
 	#include <cuda_fp16.h>
 }
 
-// explicit constructors?
+// explicit constructors? are (or why aren't) the constructors here converting?
 // scalar left-multiply/right-multiply not defined
 
 class half
