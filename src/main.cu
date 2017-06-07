@@ -20,6 +20,10 @@
 
 //#define FP32
 #define FP16
+// should probably return fp32 modulus regardless, for downstream
+
+// 1.9sec in FFT, 0.7sec in multiply for FP32
+// 2.3sec in FFT, 0.5sec in multiply for FP16
 
 #define N 1024
 #define DX (5.32f / 1024.f)
@@ -28,7 +32,7 @@
 #define Z0 30
 #define LAMBDA0 0.000488f
 #define NUM_SLICES 100
-#define NUM_FRAMES 30
+#define NUM_FRAMES 10
 
 #ifdef FP32
 typedef cufftComplex complex;
@@ -70,7 +74,7 @@ void construct_psf(float z, T *g, float norm)
 
 // exploit Fourier duality to shift without copying
 // credit to http://www.orangeowlsolutions.com/archives/251
-template <class T>
+template <typename T>
 __global__
 void frequency_shift(T *data)
 {
@@ -102,7 +106,7 @@ float2 cmul(float2 a, float2 b)
 }
 
 // using fourfold symmetry of z, Hermitian symmetry of w
-template <class T>
+template <typename T>
 __global__
 void quadrant_multiply(T *z, T *w) //, int i, int j)
 {
@@ -402,7 +406,7 @@ int main(int argc, char* argv[])
 										 CUFFT_INVERSE) );
 
 #ifdef FP16
-			modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));
+			modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));
 #endif
 #ifdef FP32
 			modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
