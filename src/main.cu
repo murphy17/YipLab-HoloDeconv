@@ -400,8 +400,6 @@ int main(int argc, char* argv[])
 										 in_buffer + N*N*slice,
 										 CUFFT_INVERSE) );
 
-			view_gpu(in_buffer + N*N*slice, N*N, true);
-
 #ifdef FP16
 			modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));
 #endif

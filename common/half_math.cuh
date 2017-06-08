@@ -197,7 +197,8 @@ half2 cmul(half2 a, half2 b)
 //	c.x = a.x * b.x - a.y * b.y;
 //	c.y = a.x * b.y + a.y * b.x;
 //	return c;
-	return half2(cuda_fp16::__hfma2(b, half2(a.x), flip(conj(b)) * a.y));
+	return half2(cuda_fp16::__hfma2(b, cuda_fp16::__low2half2(a),
+									flip(conj(b)) * cuda_fp16::__high2half2(a)));
 }
 
 #endif
