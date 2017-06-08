@@ -14,7 +14,7 @@
 #include <algorithm>
 
 #include "cuda_common.h"
-#include "cuda_half.hpp"
+#include "half_math.hpp"
 #include "half.hpp"
 #include "util.hpp"
 
@@ -35,7 +35,7 @@
 #define NUM_FRAMES 10
 
 #ifdef FP32
-typedef cufftComplex complex;
+typedef float2 complex;
 typedef float real;
 #endif
 #ifdef FP16
@@ -46,9 +46,8 @@ typedef half real;
 typedef unsigned char byte;
 
 // Kernel to construct the point-spread function at distance z
-template <typename T>
 __global__
-void construct_psf(float z, T *g, float norm)
+void construct_psf(float z, complex *g, float norm)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
@@ -69,19 +68,18 @@ void construct_psf(float z, T *g, float norm)
 	r = __fdividef(r, norm); // norm = -2.f * z / LAMBDA0 (also / N if half)
 
 	// re(iz) = -im(z), im(iz) = re(z)
-	g[i*N+j] = {__fdividef(-im, r), __fdividef(re, r)};
+	g[i*N+j] = (complex)(float2){__fdividef(-im, r), __fdividef(re, r)};
 }
 
 // exploit Fourier duality to shift without copying
 // credit to http://www.orangeowlsolutions.com/archives/251
-template <typename T>
 __global__
-void frequency_shift(T *data)
+void frequency_shift(complex *data)
 {
     const int i = blockIdx.x;
     const int j = threadIdx.x;
 
-	const float a = 1 - 2 * ((i+j) & 1); // this looks like a checkerboard?
+	const real a = (real)(1 - 2 * ((i+j) & 1)); // this looks like a checkerboard?
 
 	data[i*N+j].x *= a;
 	data[i*N+j].y *= a;
@@ -106,23 +104,22 @@ float2 cmul(float2 a, float2 b)
 }
 
 // using fourfold symmetry of z, Hermitian symmetry of w
-template <typename T>
 __global__
-void quadrant_multiply(T *z, T *w) //, int i, int j)
+void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
 	const int ii = N-i;
 	const int jj = N-j;
 
-	T w1 = w[i*N+j];
+	complex w1 = w[i*N+j];
 
 	if ((i>0 && i<N/2) && (j>0 && j<N/2))
 	{
-		T w2 = w[ii*N+j];
+		complex w2 = w[ii*N+j];
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			T z_ij = z[i*N+j];
+			complex z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
 			z[ii*N+jj] = cmul(conj(w1), z_ij);
 			z[ii*N+j] = cmul(w2, z_ij);
@@ -133,10 +130,10 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 	}
 	else if (i>0 && i<N/2)
 	{
-		T w2 = w[ii*N+j];
+		complex w2 = w[ii*N+j];
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			T z_ij = z[i*N+j];
+			complex z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
 			z[ii*N+j] = cmul(w2, z_ij);
 			z += N*N;
@@ -144,10 +141,10 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 	}
 	else if (j>0 && j<N/2)
 	{
-		T w2 = w[i*N+jj];
+		complex w2 = w[i*N+jj];
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			T z_ij = z[i*N+j];
+			complex z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
 			z[i*N+jj] = cmul(w2, z_ij);
 			z += N*N;
@@ -157,16 +154,15 @@ void quadrant_multiply(T *z, T *w) //, int i, int j)
 	{
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			T z_ij = z[i*N+j];
+			complex z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
 			z += N*N;
 		}
 	}
 }
 
-template<typename T>
 __global__
-void mirror_quadrants(T *z)
+void mirror_quadrants(complex *z)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
@@ -178,15 +174,14 @@ void mirror_quadrants(T *z)
 	if (i>0&&i<N/2&&j>0&&j<N/2) z[ii*N+jj] = z[i*N+j];
 }
 
-template<typename T>
 __global__
-void byte_to_complex(byte *b, T *z)
+void byte_to_complex(byte *b, complex *z)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	z[i*N+j].x = ((float)(b[i*N+j])) / 255.f;
-	z[i*N+j].y = 0.f;
+	z[i*N+j].x = (real)(((float)(b[i*N+j])) / 255.f);
+	z[i*N+j].y = (real)0.f;
 }
 
 // careful!!! half is an OBJECT now, so it gets passed as a *reference* ???
@@ -196,23 +191,22 @@ void scale(half2 *x, float a)
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	x[i*N+j] *= (half2)a; // multiplication is not working, investigate tomorrow
+	x[i*N+j] *= (half)a;
 }
 
-template <typename T>
-cudaError_t transfer_psf(T *psf, T *buffer, cudaStream_t stream)
+cudaError_t transfer_psf(complex *psf, complex *buffer, cudaStream_t stream)
 {
 	// generate parameters for 3D copy
 	cudaMemcpy3DParms p = { 0 };
 	p.srcPtr.ptr = psf;
-	p.srcPtr.pitch = (N/2+1) * sizeof(T);
+	p.srcPtr.pitch = (N/2+1) * sizeof(complex);
 	p.srcPtr.xsize = (N/2+1);
 	p.srcPtr.ysize = (N/2+1);
 	p.dstPtr.ptr = buffer;
-	p.dstPtr.pitch = N * sizeof(T);
+	p.dstPtr.pitch = N * sizeof(complex);
 	p.dstPtr.xsize = N;
 	p.dstPtr.ysize = N;
-	p.extent.width = (N/2+1) * sizeof(T);
+	p.extent.width = (N/2+1) * sizeof(complex);
 	p.extent.height = (N/2+1);
 	p.extent.depth = NUM_SLICES;
 	p.kind = cudaMemcpyHostToDevice;
@@ -233,7 +227,7 @@ void modulus(half2 *z, half *r, float scale)
 {
 	int offset = blockIdx.x * N + threadIdx.x * 2;
 	half2 r2, z2;
-	half2 scale_ = scale;
+	half2 scale_ = (half)scale;
 
 	z2 = z[offset] * scale_;
 	z2 *= z2;
@@ -390,6 +384,8 @@ int main(int argc, char* argv[])
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
 
+//		view_gpu(image, N*N, true);
+
 		// random thought: an abstraction layer between kernel allocation and matrix dims would be nice
 		// will likely involve template method
 
@@ -400,10 +396,14 @@ int main(int argc, char* argv[])
 		// inverse FFT the product - batch FFT gave no speedup
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
+//			view_gpu(in_buffer + N*N*slice, N*N, true);
+
 			checkCudaErrors( cufftXtExec(fft_plan,
 										 in_buffer + N*N*slice,
 										 in_buffer + N*N*slice,
 										 CUFFT_INVERSE) );
+
+//			view_gpu(in_buffer + N*N*slice, N*N, true);
 
 #ifdef FP16
 			modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));

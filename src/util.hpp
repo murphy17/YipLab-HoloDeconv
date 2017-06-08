@@ -11,7 +11,7 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 
-#include "cuda_half.hpp"
+#include "half_math.hpp"
 
 #if CV_MAJOR_VERSION == 3
 #include <opencv2/core/cuda.hpp>
