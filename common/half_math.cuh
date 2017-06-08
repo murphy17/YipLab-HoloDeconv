@@ -108,5 +108,6 @@ inline __device__ half2 flip(half2 a) { return cuda_fp16::__lowhigh2highlow(a); 
 inline __device__ half2 conj(half2 a) { half2 b(a); *(int *)&b.x ^= 1 << 31; return b; }
 inline __device__ half2 cmul(half2 a, half2 b) { return cuda_fp16::__hfma2(b, cuda_fp16::__low2half2(a),
 																		   flip(conj(b))*cuda_fp16::__high2half2(a)); }
+inline __device__ half mod(half2 a) { half2 b = a*a; return sqrt(b.x + b.y); }
 
 #endif

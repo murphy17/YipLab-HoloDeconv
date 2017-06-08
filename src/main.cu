@@ -18,8 +18,8 @@
 #include "half.hpp"
 #include "util.hpp"
 
-//#define FP32
-#define FP16
+#define FP32
+//#define FP16
 // should probably return fp32 modulus regardless, for downstream
 
 // 1.9sec in FFT, 0.7sec in multiply for FP32
