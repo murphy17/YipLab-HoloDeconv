@@ -32,7 +32,7 @@
 #define Z0 30
 #define LAMBDA0 0.000488f
 #define NUM_SLICES 100
-#define NUM_FRAMES 10
+#define NUM_FRAMES 5
 
 #ifdef FP32
 typedef float2 complex;
