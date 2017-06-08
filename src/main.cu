@@ -14,7 +14,7 @@
 #include <algorithm>
 
 #include "cuda_common.h"
-#include "half_math.hpp"
+#include "half_math.cuh"
 #include "half.hpp"
 #include "util.hpp"
 
@@ -68,7 +68,7 @@ void construct_psf(float z, complex *g, float norm)
 	r = __fdividef(r, norm); // norm = -2.f * z / LAMBDA0 (also / N if half)
 
 	// re(iz) = -im(z), im(iz) = re(z)
-	g[i*N+j] = (complex)(float2){__fdividef(-im, r), __fdividef(re, r)};
+	g[i*N+j] = {__fdividef(-im, r), __fdividef(re, r)};
 }
 
 // exploit Fourier duality to shift without copying
@@ -175,12 +175,12 @@ void mirror_quadrants(complex *z)
 }
 
 __global__
-void byte_to_complex(byte *b, complex *z)
+void byte_to_complex(byte *b, complex *z, float norm_factor = 1.0f)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x; // blockDim shall equal N
 
-	z[i*N+j].x = (real)(((float)(b[i*N+j])) / 255.f);
+	z[i*N+j].x = (real)(((float)(b[i*N+j])) / (255.f * norm_factor));
 	z[i*N+j].y = (real)0.f;
 }
 
@@ -373,18 +373,17 @@ int main(int argc, char* argv[])
 		checkCudaErrors( cudaStreamSynchronize(copy_stream) );
 		checkCudaErrors( transfer_psf(host_psf, in_buffers[(frame + 1) % 2], copy_stream) );
 
+#ifdef FP32
 		// up-cast to complex
 		byte_to_complex<<<N, N, 0, math_stream>>>(image_u8, image);
-
-		// haven't really investigated where best place is to scale, or what to scale by...
+#endif
 #ifdef FP16
-		scale<<<N, N, 0, math_stream>>>(image, 1.f / (float)N);
+		// up-cast to complex
+		byte_to_complex<<<N, N, 0, math_stream>>>(image_u8, image, N);
 #endif
 
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
-
-//		view_gpu(image, N*N, true);
 
 		// random thought: an abstraction layer between kernel allocation and matrix dims would be nice
 		// will likely involve template method
@@ -396,14 +395,12 @@ int main(int argc, char* argv[])
 		// inverse FFT the product - batch FFT gave no speedup
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-//			view_gpu(in_buffer + N*N*slice, N*N, true);
-
 			checkCudaErrors( cufftXtExec(fft_plan,
 										 in_buffer + N*N*slice,
 										 in_buffer + N*N*slice,
 										 CUFFT_INVERSE) );
 
-//			view_gpu(in_buffer + N*N*slice, N*N, true);
+			view_gpu(in_buffer + N*N*slice, N*N, true);
 
 #ifdef FP16
 			modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));

@@ -11,7 +11,7 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
 
-#include "half_math.hpp"
+#include "half_math.cuh"
 
 #if CV_MAJOR_VERSION == 3
 #include <opencv2/core/cuda.hpp>
@@ -75,7 +75,10 @@ void view_gpu(half2 *x, int elements, bool log)
 	A.convertTo(A, CV_32FC1);
 	if (log)
 		cv::log(A, A);
+
 	cv::normalize(A, A, 1.0, 0.0, cv::NORM_MINMAX, -1);
+
+//	std::cout << A << std::endl;
 
 	cv::namedWindow("Display window", cv::WINDOW_NORMAL); // Create a window for display.
 	cv::imshow("Display window", A); // Show our image inside it.
