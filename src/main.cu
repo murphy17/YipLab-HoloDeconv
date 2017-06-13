@@ -12,6 +12,8 @@
 #include <cuda_runtime.h>
 #include <cufftXt.h>
 #include <algorithm>
+#include <string.h>
+#include <stdlib.h>
 
 #include "cuda_common.h"
 #include "half_math.cuh"
@@ -32,7 +34,7 @@
 #define Z0 30
 #define LAMBDA0 0.000488f
 #define NUM_SLICES 100
-#define NUM_FRAMES 5
+#define NUM_FRAMES 10
 
 #ifdef FP32
 typedef float2 complex;
@@ -105,7 +107,7 @@ float2 cmul(float2 a, float2 b)
 
 // using fourfold symmetry of z
 __global__
-void quadrant_multiply(complex *z, complex *w) //, int i, int j)
+void quadrant_multiply(complex *z, complex *w, char *mask) //, int i, int j)
 {
 	const int i = blockIdx.x;
 	const int j = threadIdx.x;
@@ -121,14 +123,14 @@ void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			complex z_ij = z[i*N+j];
-			z[i*N+j] = cmul(w1, z_ij);
-//			z[ii*N+jj] = cmul(conj(w1), z_ij);
-			z[ii*N+jj] = cmul(w4, z_ij);
-			z[ii*N+j] = cmul(w2, z_ij);
-//			z[i*N+jj] = cmul(conj(w2), z_ij);
-			z[i*N+jj] = cmul(w3, z_ij);
-
+			if (mask[k])
+			{
+				complex z_ij = z[i*N+j];
+				z[i*N+j] = cmul(w1, z_ij);
+				z[ii*N+jj] = cmul(w4, z_ij);
+				z[ii*N+j] = cmul(w2, z_ij);
+				z[i*N+jj] = cmul(w3, z_ij);
+			}
 			z += N*N;
 		}
 	}
@@ -139,9 +141,12 @@ void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			complex z_ij = z[i*N+j];
-			z[i*N+j] = cmul(w1, z_ij);
-			z[ii*N+j] = cmul(w2, z_ij);
+			if (mask[k])
+			{
+				complex z_ij = z[i*N+j];
+				z[i*N+j] = cmul(w1, z_ij);
+				z[ii*N+j] = cmul(w2, z_ij);
+			}
 			z += N*N;
 		}
 	}
@@ -152,9 +157,12 @@ void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			complex z_ij = z[i*N+j];
-			z[i*N+j] = cmul(w1, z_ij);
-			z[i*N+jj] = cmul(w2, z_ij);
+			if (mask[k])
+			{
+				complex z_ij = z[i*N+j];
+				z[i*N+j] = cmul(w1, z_ij);
+				z[i*N+jj] = cmul(w2, z_ij);
+			}
 			z += N*N;
 		}
 	}
@@ -164,8 +172,11 @@ void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
-			complex z_ij = z[i*N+j];
-			z[i*N+j] = cmul(w1, z_ij);
+			if (mask[k])
+			{
+				complex z_ij = z[i*N+j];
+				z[i*N+j] = cmul(w1, z_ij);
+			}
 			z += N*N;
 		}
 	}
@@ -261,32 +272,12 @@ void half_to_float(half *h, float *f)
 	f[blockIdx.x*N+threadIdx.x] = (float)h[blockIdx.x*N+threadIdx.x];
 }
 
-//#define TESTING
-
-#ifdef TESTING
-__global__
-void test(float2 *d)
-{
-	half2 z = {3.0f, -5.0f};
-	half2 z2 = z * z;
-	d[0] = {(float)sqrt(z2.x+z2.y), 0.f};
-}
-
-int main()
-{
-	float2 *d;
-	float2 h;
-	cudaMalloc(&d, sizeof(float2));
-	test<<<1,1>>>(d);
-	cudaMemcpy(&h, d, sizeof(float2), cudaMemcpyDeviceToHost);
-	std::cout << h.x << " " << h.y << std::endl;
-}
-#endif
-
-#ifndef TESTING
 int main(int argc, char* argv[])
 {
 	checkCudaErrors( cudaDeviceReset() );
+
+	// checkCudaErrors( cudaSetDeviceFlags(cudaDeviceMapHost) );
+	// checkCudaErrors( cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte) );
 
 	complex *image;
 	checkCudaErrors( cudaMalloc(&image, N*N*sizeof(complex)) );
@@ -309,6 +300,14 @@ int main(int argc, char* argv[])
 
 	real *out_buffer;
 	checkCudaErrors( cudaMalloc(&out_buffer, NUM_SLICES*N*N*sizeof(real)) );
+
+	// managed memory would be much nicer here, esp on Tegra, but was causing problems w/ streams
+	char *host_mask, *mask;
+	// checkCudaErrors( cudaMallocManaged(&mask, NUM_SLICES*sizeof(char), cudaMemAttachGlobal) );
+	checkCudaErrors( cudaMallocHost(&host_mask, NUM_SLICES*sizeof(char)) );
+	checkCudaErrors( cudaMalloc(&mask, NUM_SLICES*sizeof(char)) );
+	memset(host_mask, 1, NUM_SLICES);
+	checkCudaErrors( cudaMemcpy(mask, host_mask, NUM_SLICES*sizeof(char), cudaMemcpyHostToDevice) );
 
 	cudaDataType fft_type;
 #ifdef FP32
@@ -347,8 +346,6 @@ int main(int argc, char* argv[])
 		// do the frequency shift here instead, complex multiplication commutes
 		// this is subtle - shifting in conjugate domain means we don't need to FFT shift later
 		frequency_shift<<<N/2+1, N/2+1>>>(psf);
-
-		// TODO: the PSF quadrants themselves are symmetric matrices...
 
 		// copy the upper-left submatrix
 		checkCudaErrors( cudaMemcpy2D(host_psf + (N/2+1)*(N/2+1)*slice, (N/2+1)*sizeof(complex),
@@ -395,28 +392,34 @@ int main(int argc, char* argv[])
 		// FFT the image in-place
 		checkCudaErrors( cufftXtExec(fft_plan, image, image, CUFFT_FORWARD) );
 
-		// random thought: an abstraction layer between kernel allocation and matrix dims would be nice
-		// will likely involve template method
-
 		// batch-multiply with FFT'ed image
-		// TODO: write a wrapper that takes care of ugly dimension sizes
-		quadrant_multiply<<<N/2+1, N/2+1, 0, math_stream>>>(in_buffer, image);
+		quadrant_multiply<<<N/2+1, N/2+1, 0, math_stream>>>(in_buffer, image, mask);
 
 		// inverse FFT the product - batch FFT gave no speedup
 		for (int slice = 0; slice < NUM_SLICES; slice++)
 		{
-			checkCudaErrors( cufftXtExec(fft_plan,
-										 in_buffer + N*N*slice,
-										 in_buffer + N*N*slice,
-										 CUFFT_INVERSE) );
+			if (host_mask[slice])
+			{
+				checkCudaErrors( cufftXtExec(fft_plan,
+											 in_buffer + N*N*slice,
+											 in_buffer + N*N*slice,
+											 CUFFT_INVERSE) );
 
 #ifdef FP16
-			modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));
+				modulus<<<N, N/2, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice, 1.f / (float)N); // 1.f / sqrt((float)N));
 #endif
 #ifdef FP32
-			modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
+				modulus<<<N, N, 0, math_stream>>>(in_buffer + N*N*slice, out_buffer + N*N*slice);
+			}
 #endif
 		}
+
+		// construct volume from one frame's worth of slices once they're ready...
+		cudaStreamSynchronize(math_stream);
+		// ... and return the next slices to query (i.e. might want to query all every 1sec or so)
+		 memset(host_mask, 1, NUM_SLICES);
+
+		checkCudaErrors( cudaMemcpy(mask, host_mask, NUM_SLICES*sizeof(char), cudaMemcpyHostToDevice) );
 
 		// start timer after first run, GPU "warmup"
 		if (frame == 0)
@@ -460,4 +463,3 @@ int main(int argc, char* argv[])
 
 	return 0;
 }
-#endif
