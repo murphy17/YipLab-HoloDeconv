@@ -103,7 +103,7 @@ float2 cmul(float2 a, float2 b)
 	return c;
 }
 
-// using fourfold symmetry of z, Hermitian symmetry of w
+// using fourfold symmetry of z
 __global__
 void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 {
@@ -112,25 +112,31 @@ void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 	const int ii = N-i;
 	const int jj = N-j;
 
-	complex w1 = w[i*N+j];
-
 	if ((i>0 && i<N/2) && (j>0 && j<N/2))
 	{
+		complex w1 = w[i*N+j];
 		complex w2 = w[ii*N+j];
+		complex w3 = w[i*N+jj];
+		complex w4 = w[ii*N+jj];
+
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			complex z_ij = z[i*N+j];
 			z[i*N+j] = cmul(w1, z_ij);
-			z[ii*N+jj] = cmul(conj(w1), z_ij);
+//			z[ii*N+jj] = cmul(conj(w1), z_ij);
+			z[ii*N+jj] = cmul(w4, z_ij);
 			z[ii*N+j] = cmul(w2, z_ij);
-			z[i*N+jj] = cmul(conj(w2), z_ij);
+//			z[i*N+jj] = cmul(conj(w2), z_ij);
+			z[i*N+jj] = cmul(w3, z_ij);
 
 			z += N*N;
 		}
 	}
 	else if (i>0 && i<N/2)
 	{
+		complex w1 = w[i*N+j];
 		complex w2 = w[ii*N+j];
+
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			complex z_ij = z[i*N+j];
@@ -141,7 +147,9 @@ void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 	}
 	else if (j>0 && j<N/2)
 	{
+		complex w1 = w[i*N+j];
 		complex w2 = w[i*N+jj];
+
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			complex z_ij = z[i*N+j];
@@ -152,6 +160,8 @@ void quadrant_multiply(complex *z, complex *w) //, int i, int j)
 	}
 	else
 	{
+		complex w1 = w[i*N+j];
+
 		for (int k = 0; k < NUM_SLICES; k++)
 		{
 			complex z_ij = z[i*N+j];
