@@ -417,7 +417,7 @@ int main(int argc, char* argv[])
 		// construct volume from one frame's worth of slices once they're ready...
 		cudaStreamSynchronize(math_stream);
 		// ... and return the next slices to query (i.e. might want to query all every 1sec or so)
-		 memset(host_mask, 1, NUM_SLICES);
+		memset(host_mask, 1, NUM_SLICES);
 
 		checkCudaErrors( cudaMemcpy(mask, host_mask, NUM_SLICES*sizeof(char), cudaMemcpyHostToDevice) );
 
